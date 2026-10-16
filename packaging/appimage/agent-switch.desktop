@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=agent-switch
+Comment=Launch a coding agent against a local OpenAI-compatible model server
+Exec=agent-switch
+Icon=agent-switch
+Terminal=true
+Categories=Development;
