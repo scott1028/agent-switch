@@ -34,7 +34,7 @@ from agent_switch.core.launch import (
     _run,
     _run_native,
 )
-from agent_switch.core.mcp import load_mcp_servers
+from agent_switch.core.mcp import _mcp_registry_path, load_mcp_servers
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -117,7 +117,8 @@ _DSH_TUI_COMMANDS = ("dsh-tui", "dst")
 
 
 _DSH_LAUNCHER_ARGS = frozenset(
-    "--profile --patch --dump-config --dump-default-config -V --version plugin web".split()
+    "--profile --from-default-profile --patch --dump-config --dump-default-config "
+    "--dump-config-schema -V --version plugin web".split()
 )
 
 
@@ -145,7 +146,9 @@ _DSH_PERSIST_OPTION = typer.Option(
 
 def _dsh_command(args: list[str], patch: Optional[str] = None) -> list[str]:
     head = args[0] if args else ""
-    if head in _DSH_LAUNCHER_ARGS or head.startswith(("--profile=", "--patch=")):
+    if head in _DSH_LAUNCHER_ARGS or head.startswith(
+        ("--profile=", "--from-default-profile=", "--patch=")
+    ):
         command = ["dsh", *args]
     else:
         command = ["dsh", "web", *args]
@@ -162,7 +165,7 @@ _DSH_VALUE_ARGS = frozenset("--profile --patch --from-default-profile".split())
 
 
 # Launcher options that print the profile tree and exit instead of booting it.
-_DSH_DUMP_ARGS = frozenset("--dump-config --dump-default-config".split())
+_DSH_DUMP_ARGS = frozenset("--dump-config --dump-default-config --dump-config-schema".split())
 
 
 def _get_dsh_boot_profile(command: list[str]) -> Optional[str]:
@@ -199,6 +202,12 @@ _DSH_TUI_SUBCOMMANDS = frozenset(
 )
 
 
+# Read the same way, these hand off to the launcher's separate CLI app instead of the TUI.
+_DSH_TUI_CLI_SUBCOMMANDS = frozenset(
+    "cli run -p --print session models skills mcp auth capabilities dsh".split()
+)
+
+
 # The launcher's own leading options take the next token raw, even a flag-shaped one, and are read
 # only until the first app argument.
 _DSH_TUI_HOST_VALUE_ARGS = frozenset("--profile --from-default-profile --patch".split())
@@ -219,12 +228,13 @@ def _check_dsh_tui_args(agent: str, args: list[str]) -> None:
     """Refuse arguments that would bypass the agent-switch route, read as the launcher reads them.
 
     Mirrors the argument loop of dsh-tui's bin/dsh-tui.js: only the first argument can be a
-    maintenance command, option values are raw tokens, a first existing path is the workspace
+    maintenance or CLI command, option values are raw tokens, a first existing path is the workspace
     target, and everything from a literal `--` on is the app's prompt.
     """
-    if args[:1] and args[0] in _DSH_TUI_SUBCOMMANDS:
+    if args[:1] and args[0] in _DSH_TUI_SUBCOMMANDS | _DSH_TUI_CLI_SUBCOMMANDS:
+        kind = "CLI" if args[0] in _DSH_TUI_CLI_SUBCOMMANDS else "maintenance"
         _fail(
-            f"`{args[0]}` is a dsh-tui maintenance command, which {agent} does not run; "
+            f"`{args[0]}` is a dsh-tui {kind} command, which {agent} does not run; "
             f"run `dsh-tui {args[0]}` directly. Use `-- -- {args[0]}` to send it as a prompt."
         )
     has_patch = has_app_args = has_workspace = False
@@ -288,8 +298,19 @@ class _JsExpression(str):
     """A dsh loader `!!js` value: evaluated at boot, so it must not be written as a plain string."""
 
 
+def _check_dsh_mcp_names(mcp_servers: Optional[dict]) -> None:
+    # dsh-mcp-client accepts a serverName of at most 32 characters.
+    for name in mcp_servers or {}:
+        if len(name) > 32:
+            _fail(
+                f"MCP server name {name!r} has {len(name)} characters; dsh allows at most 32. "
+                "Name it yourself with NAME:... in --mcp-url, --mcp-oauth-url or --mcp-stdio; "
+                f"for --mcp or --mcp-all, rename it in {_mcp_registry_path()}."
+            )
+
+
 def _dsh_mcp_config(name: str, server: dict) -> dict:
-    """One dsh-mcp-client 0.1.5-rc.2 config block for a mounted MCP server."""
+    """One dsh-mcp-client config block for a mounted MCP server."""
     if server["transport"] == "stdio":
         return {
             "transport": "stdio",
@@ -333,6 +354,8 @@ def _dsh_model_entry(
             "low": "low",
             "medium": "medium",
             "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
         }
     return entry
 
@@ -428,14 +451,13 @@ def write_dsh_patch(
                 ]
             }
         )
-    # TODO: dsh >= 0.1.7 keeps /settings in the profile patch, and this row replaces the whole
-    # dsh-tui block, so settings changed there may be overridden on boot; verify on a 0.2.x harness.
+    # /settings lives in ~/.dsh-tui/settings.json, a user layer above this row.
     if is_tui:
-        # A patch row replaces dsh-tui's whole config block (no deep merge), so restate the six
-        # keys of the dsh-tui 0.14.0 row; the !!js bindings carry the launcher's workspace and
-        # resume handoff. An explicit provider/model pair outranks ~/.dsh-tui/model.json, and
-        # backend: dsh outranks DSH_TUI_BACKEND and the remembered kernel, so the first boot
-        # always lands on this route.
+        # A patch row replaces dsh-tui's whole config block (no deep merge), so restate the eight
+        # keys of the dsh-tui 0.16.1 row (plus model); the !!js bindings carry the launcher's
+        # workspace and resume handoff. A saved /model pick in ~/.dsh-tui/model.json outranks the
+        # provider/model pair, so each launch deletes it; backend: dsh outranks DSH_TUI_BACKEND
+        # and the remembered kernel, so the first boot always lands on this route.
         entries.append(
             {
                 "id": "dsh-tui",
@@ -850,6 +872,7 @@ def dsh(
             stdios = mcp_stdio,
             envs = mcp_env,
         )
+        _check_dsh_mcp_names(mcp_servers)
         with _session_config(f"{_DSH_TUI_AGENT if is_tui else 'dsh'}-native", launch) as home:
             patch = home / _DSH_PATCH_FILE
             patch_arg = None
@@ -905,6 +928,7 @@ def dsh(
         stdios = mcp_stdio,
         envs = mcp_env,
     )
+    _check_dsh_mcp_names(mcp_servers)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     install_hint = _npm_install_hint(_DSH_TUI_PACKAGE if is_tui else _DSH_PACKAGE)
     if not is_tui:
@@ -980,6 +1004,8 @@ def dsh(
         unset_env = ()
         if is_tui:
             _seed_dsh_tui_state(home)
+            # A saved /model pick wins over the patch row's provider/model, so drop it each launch.
+            (home / ".dsh-tui" / "model.json").unlink(missing_ok = True)
             env.update(_get_dsh_tui_env(home))
             child_path = _get_dsh_tui_child_path(home, harness) if harness else None
             if child_path:

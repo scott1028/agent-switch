@@ -474,3 +474,69 @@ test("concurrent tool calls share the four-agent cap", async () => {{
     assert completed.returncode == 0, completed.stdout + completed.stderr
     observed = [int(value) for value in peaks.read_text().splitlines()]
     assert max(observed) == 4
+
+
+def test_pi_reloaded_extension_keeps_its_configuration(tmp_path):
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("Bun is required to execute the bundled Pi extension")
+
+    config = tmp_path / "subagent.json"
+    config.write_text(
+        json.dumps(
+            {
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "apiKey": "private-token",
+                "model": "local-model",
+            }
+        ),
+        encoding = "utf-8",
+    )
+    extension = Path(__file__).parents[1] / "agent_switch" / "agents" / "pi_subagent.ts"
+    # Bun caches a module by path, so a copy stands in for jiti's fresh evaluation on /reload.
+    reloaded_extension = tmp_path / "pi_subagent_reloaded.ts"
+    shutil.copyfile(extension, reloaded_extension)
+    test_file = tmp_path / "pi-reload.test.ts"
+    test_file.write_text(
+        f"""
+import {{ expect, mock, test }} from "bun:test";
+import {{ pathToFileURL }} from "node:url";
+
+mock.module("typebox", () => ({{
+    Type: {{
+        Object: (value) => value,
+        String: (value) => value,
+        Optional: (value) => value,
+        Array: (value) => value,
+    }},
+}}));
+
+test("a reloaded extension keeps its configuration", async () => {{
+    process.env.AGENT_SWITCH_PI_SUBAGENT_CONFIG = {str(config)!r};
+    const first = await import(pathToFileURL({str(extension)!r}).href);
+    first.default({{ registerProvider() {{}}, registerTool() {{}} }});
+    // Child processes must not inherit the config path.
+    expect(process.env.AGENT_SWITCH_PI_SUBAGENT_CONFIG).toBeUndefined();
+
+    // Pi's /reload runs the module body again (jiti moduleCache: false).
+    const reloaded = await import(pathToFileURL({str(reloaded_extension)!r}).href);
+    let provider;
+    reloaded.default({{
+        registerProvider(name, value) {{ provider = value; }},
+        registerTool() {{}},
+    }});
+    expect(provider.apiKey).toBe("private-token");
+    expect(provider.baseUrl).toBe("http://127.0.0.1:8000/v1");
+}});
+""",
+        encoding = "utf-8",
+    )
+
+    completed = subprocess.run(
+        [bun, "test", str(test_file)],
+        capture_output = True,
+        text = True,
+        timeout = 15,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr

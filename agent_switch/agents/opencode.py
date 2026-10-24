@@ -13,6 +13,7 @@ from typing import Literal, Optional
 import typer
 
 from agent_switch.core.install import (
+    _codex_executable_version,
     _npm_install_hint,
     _probe_env,
     _require_agent_for_launch,
@@ -95,11 +96,13 @@ _OPENCODE_NON_AUTO_SUBCOMMANDS = frozenset(
 
 
 _OPENCODE_V2_SUBCOMMANDS = frozenset(
-    "acp api debug console auth mcp plugin models export import mini run service pair serve".split()
+    "upgrade update uninstall acp api debug auth mcp plugin models stats mini run session service "
+    "reload pair serve".split()
 )
 
 
-_OPENCODE_V2_STANDALONE_SUBCOMMANDS = frozenset("api models export import mini run".split())
+# Not reload: with --standalone it reloads a throwaway private server, not the background service.
+_OPENCODE_V2_STANDALONE_SUBCOMMANDS = frozenset("api models stats mini run session".split())
 
 
 _OPENCODE_GLOBAL_BOOLEAN_OPTIONS = frozenset(
@@ -119,7 +122,10 @@ def _opencode_command() -> tuple[str, bool]:
     resolved_v2 = _which_with_install_dirs("opencode2")
     if resolved_v2:
         return resolved_v2, True
-    return "opencode", False
+    # Homebrew and the Arch package install OpenCode 2 as plain `opencode`; missing or unparseable stays V1.
+    resolved = _which_with_install_dirs("opencode")
+    version = _codex_executable_version(resolved) if resolved else None
+    return "opencode", version is not None and version[0] >= 2
 
 
 def _opencode_supports_native_auto(command: str = "opencode") -> bool:
@@ -321,8 +327,8 @@ def opencode_compaction_reserved(window: int, output: int, ratio: Optional[float
     return max(1, min(output, max(window // 10, 8192)))
 
 
-def _opencode_output_env(model: dict, max_tokens: Optional[int]) -> dict:
-    """Lift OpenCode's output ceiling when --max-tokens exceeds it; re-emit an inherited one so a --no-launch recipe keeps it."""
+def _opencode_output_env(model: dict, max_tokens: Optional[int], v2: bool = False) -> dict:
+    """Lift OpenCode 1's output ceiling when --max-tokens exceeds it; re-emit an inherited one so a --no-launch recipe keeps it."""
     window = model.get("context_length") or model.get("max_context_length")
     if not max_tokens:
         return {}
@@ -333,6 +339,9 @@ def _opencode_output_env(model: dict, max_tokens: Optional[int]) -> dict:
         )
         return {}
     output = _agent_output_limit(int(window), max_tokens)
+    if v2:
+        # OpenCode 2 never reads the env var; it sends limit.output, up to 256k.
+        return {}
     raw = os.environ.get(_OPENCODE_OUTPUT_TOKEN_MAX_ENV, "")
     inherited = int(raw) if raw.isdigit() and int(raw) > 0 else None
     ceiling = inherited or _OPENCODE_OUTPUT_TOKEN_MAX
@@ -345,24 +354,26 @@ def _opencode_model_entry(
     model: dict,
     max_tokens: Optional[int] = None,
     request_body: Optional[dict] = None,
+    v2: bool = False,
 ) -> dict:
     model_entry = {"name": model["id"]}
     window = model.get("context_length") or model.get("max_context_length")
     if window:
         window = int(window)
         output = opencode_output_limit(window, max_tokens)
-        # Without a limit OpenCode assumes context 0 and never compacts. Without input it compacts at context - output and ignores compaction.reserved.
+        # Without a limit OpenCode assumes context 0 and never compacts. Without input 1.x compacts at context - output and ignores compaction.reserved; 2.x compacts at (input or context) - reserved.
         model_entry["limit"] = {"context": window, "input": window, "output": output}
-    # Effort variants: OpenCode generates only low/medium/high for this provider and stops generating once any are declared, so declare all five to add xhigh. reasoningEffort is the key OpenCode maps to reasoning_effort in the 2.x request body and the only one 1.x reads.
-    # The empty none comes first: each run's auxiliary title request falls back to a low default or the first variant, and none keeps it free of reasoning effort.
-    model_entry["variants"] = {"none": {}, **{name: {"reasoningEffort": name} for name in ("low", "medium", "high", "xhigh")}}
+    # Effort variants: OpenCode generates only low/medium/high for this provider and stops generating once any are declared, so declare all six to add xhigh and max. reasoningEffort is the key OpenCode maps to reasoning_effort in the 2.x request body and the only one 1.x reads.
+    # The empty none comes first: 1.x's auxiliary title request falls back to a low default or the first variant, and 2.x picks none by id, so it stays free of reasoning effort.
+    model_entry["variants"] = {"none": {}, **{name: {"reasoningEffort": name} for name in ("low", "medium", "high", "xhigh", "max")}}
     if request_body:
-        # OpenCode 1.x sends model options, reading the effort only as reasoningEffort; 2.x sends only the provider body.
+        # OpenCode 1.x sends model options, reading the effort only as reasoningEffort; 2.x migrates them, reasoningEffort as a setting and the rest into the request body.
         model_entry["options"] = {
             "reasoningEffort" if name == "reasoning_effort" else name: value
             for name, value in request_body.items()
         }
-        if "temperature" in request_body:
+        # OpenCode 2 reports this 1.x capability as an unsupported legacy setting.
+        if "temperature" in request_body and not v2:
             model_entry["temperature"] = True
     return model_entry
 
@@ -375,6 +386,7 @@ def _opencode_provider(
     request_body: Optional[dict] = None,
     headers: Optional[dict] = None,
     served_models: Optional[list] = None,
+    v2: bool = False,
 ) -> dict:
     catalog = {entry["id"]: entry for entry in served_models or []}
     catalog[model["id"]] = model
@@ -391,7 +403,7 @@ def _opencode_provider(
         "name": "agent-switch",
         "options": provider_options,
         "models": {
-            model_id: _opencode_model_entry(entry, max_tokens, request_body)
+            model_id: _opencode_model_entry(entry, max_tokens, request_body, v2)
             for model_id, entry in catalog.items()
         },
     }
@@ -442,19 +454,23 @@ def _parse_jsonc(text: str) -> dict:
     return json.loads("".join(kept))
 
 
-def _opencode_global_mcp() -> dict:
-    """The mcp entries of the user's global opencode configs.
+def _opencode_global_mcp(v2: bool = False) -> tuple[dict, dict]:
+    """The legacy name->server entries and OpenCode 2's native mcp.servers of the user's global configs.
 
     The session overlay outranks the global config but cannot delete a global entry, so an
     unmounted one is disabled by a copy of itself (a bare {"enabled": false} can fail the
-    per-layer schema check). OpenCode loads config.json, opencode.json and opencode.jsonc
-    from its global dir, a later file winning per server, so all three are read here;
-    disabling a name OpenCode never loads is harmless.
+    per-layer schema check; OpenCode 2 replaces a server whole). OpenCode loads opencode.json
+    and opencode.jsonc from its global dir, and 1.x also config.json, a later file winning per
+    server, so those are read here. OpenCode 2 takes that dir from OPENCODE_CONFIG_DIR first.
     """
     config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     directory = Path(config_home) / "opencode"
+    if v2 and os.environ.get("OPENCODE_CONFIG_DIR"):
+        directory = Path(os.environ["OPENCODE_CONFIG_DIR"])
     servers: dict = {}
-    for name in ("config.json", "opencode.json", "opencode.jsonc"):
+    native_servers: dict = {}
+    names = ("opencode.json", "opencode.jsonc") if v2 else ("config.json", "opencode.json", "opencode.jsonc")
+    for name in names:
         path = directory / name
         if not path.is_file():
             continue
@@ -467,9 +483,18 @@ def _opencode_global_mcp() -> dict:
                 err = True,
             )
             continue
-        if isinstance(data, dict) and isinstance(data.get("mcp"), dict):
-            servers.update(data["mcp"])
-    return servers
+        if not isinstance(data, dict) or not isinstance(data.get("mcp"), dict):
+            continue
+        for server_name, entry in data["mcp"].items():
+            # OpenCode 2 reads mcp.servers and mcp.timeout as its own keys unless they hold a server.
+            if server_name in ("servers", "timeout") and not (
+                isinstance(entry, dict) and entry.get("type") in ("local", "remote")
+            ):
+                if v2 and server_name == "servers" and isinstance(entry, dict):
+                    native_servers.update(entry)
+                continue
+            servers[server_name] = entry
+    return servers, native_servers
 
 
 def _opencode_mcp_entries(mcp_servers: dict) -> dict:
@@ -506,6 +531,7 @@ def write_opencode_config(
     compact_at: Optional[float] = None,
     mcp_servers: Optional[dict] = None,
     served_models: Optional[list] = None,
+    v2: bool = False,
 ) -> dict:
     config = _read_json_object(path)
     if config is None:
@@ -526,19 +552,35 @@ def write_opencode_config(
         )
     # Keep the provider definition in this private session file. The launch path adjusts effective provider filters in the higher-priority inline overlay.
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = _opencode_provider(
-        base, key, model, max_tokens, request_body, headers, served_models
+        base, key, model, max_tokens, request_body, headers, served_models, v2
     )
     # --mcp/--mcp-all rewrite the mcp map every run: mounted servers win by name in this
     # overlay, and every unmounted entry of the user's global config is copied with
-    # enabled: false (this layer cannot delete a lower-layer entry). Without MCP flags the
-    # key is dropped, so a persisted session keeps no earlier mount.
+    # enabled: false, or disabled: true under OpenCode 2's mcp.servers (this layer cannot
+    # delete a lower-layer entry). Without MCP flags the key is dropped, so a persisted
+    # session keeps no earlier mount.
     if mcp_servers is None:
         config.pop("mcp", None)
     else:
         mounted: dict = _opencode_mcp_entries(mcp_servers)
-        for name, entry in _opencode_global_mcp().items():
+        global_servers, native_servers = _opencode_global_mcp(v2)
+        disabled_native = {
+            name: {**server, "disabled": True}
+            for name, server in native_servers.items()
+            if name not in mounted and isinstance(server, dict)
+        }
+        for name, entry in global_servers.items():
             if name not in mounted and isinstance(entry, dict):
                 mounted[name] = {**entry, "enabled": False}
+        if disabled_native:
+            if "servers" in mounted:
+                # One document cannot hold both a server named servers and the native map.
+                typer.echo(
+                    "Warning: OpenCode 2 reads mcp.servers as its server map, so your global MCP "
+                    "server named 'servers' stays enabled in this session.",
+                    err = True,
+                )
+            mounted["servers"] = disabled_native
         config["mcp"] = mounted
     # Normal mode pins this as the session model. Subagent mode leaves the user's main/small models alone and exposes the local model to @local and /models.
     opencode_model = f"{_OPENCODE_PROVIDER}/{model['id']}"
@@ -570,7 +612,7 @@ def write_opencode_config(
             if not agents:
                 config.pop("agent", None)
     if window and not as_subagent:
-        # The fixed 20k-token default buffer over-compacts, or never settles, on a small local context.
+        # 1.x's fixed 20k-token default buffer over-compacts, or never settles, on a small local context; 2.x's default keeps 15% free, at least 16k from a 32k window.
         compaction = _subdict(config, "compaction")
         compaction["auto"] = True
         compaction["reserved"] = reserved
@@ -664,7 +706,7 @@ def opencode(
     if alias and as_subagent:
         _fail("--as-subagent is not supported for agent aliases.")
     command_name, opencode_v2 = _opencode_command()
-    install_hint = _npm_install_hint("@opencode-ai/cli@beta" if opencode_v2 else "opencode-ai")
+    install_hint = _npm_install_hint("@opencode/cli@latest" if opencode_v2 else "opencode-ai")
     if alias:
         _check_alias(alias)
     else:
@@ -703,6 +745,12 @@ def opencode(
                 install_hint = install_hint,
             )
         return
+    if opencode_v2 and "servers" in (mcp_servers or {}):
+        # The session overlay may need mcp.servers for OpenCode 2's native map of disabled servers.
+        _fail(
+            "OpenCode 2 reads mcp.servers as its server map, so an MCP server here cannot be "
+            "named 'servers'; mount it under another name."
+        )
     server_options = ServerOptions(
         reasoning = reasoning,
         reasoning_effort = reasoning_effort,
@@ -758,10 +806,11 @@ def opencode(
                 request_body = server_options.request_body(),
                 headers = headers,
                 served_models = served_models,
+                v2 = opencode_v2,
             )
             env = {
                 "OPENCODE_CONFIG": str(config_path),
-                **_opencode_output_env(entry, max_tokens),
+                **_opencode_output_env(entry, max_tokens, v2 = opencode_v2),
             }
             inline_config = _opencode_subagent_inline_config(
                 config_path,
@@ -829,6 +878,7 @@ def opencode(
             compact_at = compact_at,
             mcp_servers = mcp_servers,
             served_models = served_models,
+            v2 = opencode_v2,
         )
         # A project's own opencode.json outranks OPENCODE_CONFIG, so the session model pin would silently lose to a repo config; carry it in OPENCODE_CONFIG_CONTENT, which outranks project config, while the API key stays in the private file. Only the config fallback carries a permission: native --auto omits it (auto-approve asks, keep explicit denies) and a non-yolo session omits it too, honoring project rules. V1 filters are ordinary overlays, so scope that session to our provider; V2 turns filters into security policies where global/project rules intentionally win, so keep those policies intact and tell the user above that they must allow our provider. small_model is opencode's separate model for lightweight tasks; pin it to the session model too, or a user/project small_model on another (now filtered) provider would resolve a not-found error mid-session.
         inline_config: dict = {
@@ -843,6 +893,6 @@ def opencode(
         env = {
             "OPENCODE_CONFIG": str(config_path),
             "OPENCODE_CONFIG_CONTENT": json.dumps(inline_config),
-            **_opencode_output_env(entry, max_tokens),
+            **_opencode_output_env(entry, max_tokens, v2 = opencode_v2),
         }
         _run(base, entry, env, command, launch = launch, install_hint = install_hint)

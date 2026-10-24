@@ -128,7 +128,7 @@ _PROVIDER_HEADER = f"[model_providers.{_CODEX_PROFILE}]"
 _CODEX_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
 
 
-_CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+_CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def _codex_reasoning_effort(
@@ -147,7 +147,7 @@ def _codex_provider_table(base: str, headers: Optional[dict] = None) -> str:
         'name = "agent-switch"\n'
         f"base_url = {json.dumps(base + '/v1')}\n"
     )
-    # A custom Authorization header replaces the Bearer <env_key> auth; keeping both would send two.
+    # Codex adds the env_key Bearer after http_headers, replacing a custom Authorization, so drop env_key.
     if not get_has_custom_authorization(headers or {}):
         table += f'env_key = "{_CODEX_ENV_KEY}"\n'
     table += (
@@ -265,6 +265,14 @@ _CODEX_MODEL_CATALOG_MIN_VERSION = (0, 110, 0)
 _CODEX_PATCH_LINE_ENDINGS_MIN_VERSION = (0, 148, 0)
 
 
+# Codex 0.162.0 removed the flag (patches always keep line endings); writing it then only suppresses other warnings.
+_CODEX_PATCH_LINE_ENDINGS_REMOVED_VERSION = (0, 162, 0)
+
+
+# Older Codex reads --profile as a config.toml table, not <home>/<name>.config.toml.
+_CODEX_PROFILE_MIN_VERSION = (0, 134, 0)
+
+
 # Older Codex sends no reasoning for a model without reasoning summaries, and older Pi has no samplingParams.
 _CODEX_REASONING_REQUEST_MIN_VERSION = (0, 145, 0)
 
@@ -281,10 +289,13 @@ def _codex_supports_model_catalog() -> bool:
 def _codex_supports_patch_line_endings() -> bool:
     executable = _which_with_install_dirs("codex")
     if executable is None:
-        # A normal launch installs Codex after this check; no-launch may run elsewhere.
-        return True
+        # Only --no-launch gets here without Codex; assume a current one, which has no such flag.
+        return False
     version = _codex_executable_version(executable)
-    return version is not None and version >= _CODEX_PATCH_LINE_ENDINGS_MIN_VERSION
+    return (
+        version is not None
+        and _CODEX_PATCH_LINE_ENDINGS_MIN_VERSION <= version < _CODEX_PATCH_LINE_ENDINGS_REMOVED_VERSION
+    )
 
 
 def _codex_model_catalog(
@@ -684,10 +695,11 @@ def codex(
             "route it; drop --url/--provider or use `agent-switch codex`."
         )
     install_hint = _npm_install_hint("@openai/codex")
+    executable = None
     if alias:
         _check_alias(alias)
     else:
-        _require_agent_for_launch("codex", install_hint, launch)
+        executable = _require_agent_for_launch("codex", install_hint, launch)
     if target is None:
         # Native launch: codex keeps its own model, login and ~/.codex config (no --oss, no
         # --profile, CODEX_HOME untouched); each mounted server rides its own -c flag.
@@ -711,6 +723,13 @@ def codex(
                 install_hint = install_hint,
             )
         return
+    # Both routed paths launch with --profile agent_switch; --no-launch or unparseable keeps going.
+    version = _codex_executable_version(executable) if executable else None
+    if version is not None and version < _CODEX_PROFILE_MIN_VERSION:
+        _fail(
+            f"Codex {'.'.join(map(str, version))} is too old for --url/--provider; "
+            f"0.134.0 or newer is needed. Upgrade it with: {install_hint}"
+        )
     codex_effort = _codex_reasoning_effort(reasoning, reasoning_effort)
     if codex_effort and not _agent_version_at_least("codex", _CODEX_REASONING_REQUEST_MIN_VERSION):
         codex_effort = None

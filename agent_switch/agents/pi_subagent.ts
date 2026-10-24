@@ -13,16 +13,24 @@ const provider = "agent-switch-subagent";
 const maxResultCharacters = 100_000;
 const maxParallelAgents = 4;
 const cancelGraceMilliseconds = 2_000;
-const configPath = process.env.AGENT_SWITCH_PI_SUBAGENT_CONFIG || "";
+// Pi's /reload runs this module again after the env var is gone, so keep what the first load parsed.
+const configKey = Symbol.for("agent-switch.pi-subagent.config");
+const configStore = globalThis as unknown as Record<
+	symbol,
+	{ path: string; config: Record<string, unknown> } | undefined
+>;
+const storedConfig = configStore[configKey];
+const configPath = process.env.AGENT_SWITCH_PI_SUBAGENT_CONFIG || storedConfig?.path || "";
 delete process.env.AGENT_SWITCH_PI_SUBAGENT_CONFIG;
-let config: Record<string, unknown> = {};
-if (configPath) {
+let config: Record<string, unknown> = storedConfig?.path === configPath ? storedConfig.config : {};
+if (configPath && storedConfig?.path !== configPath) {
 	try {
 		const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 			throw new Error("expected a JSON object");
 		}
 		config = parsed;
+		configStore[configKey] = { path: configPath, config };
 	} catch (error) {
 		throw new Error(`Could not read the local subagent configuration: ${error}`);
 	}

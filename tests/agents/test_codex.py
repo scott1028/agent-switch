@@ -236,8 +236,10 @@ def test_codex_model_catalog_version_gate(monkeypatch, version, expected):
         ("codex-cli 0.147.0", False),
         ("codex-cli 0.148.0", True),
         ("codex-cli 0.150.0", True),
-        ("codex-cli 0.151.0", True),
-        ("codex-cli 1.0.0", True),
+        ("codex-cli 0.161.9", True),
+        # 0.162.0 removed the flag; the suppress flag would only hide the user's own warnings.
+        ("codex-cli 0.162.0", False),
+        ("codex-cli 1.0.0", False),
     ],
 )
 def test_codex_patch_line_endings_version_gate(monkeypatch, version, expected):
@@ -248,7 +250,7 @@ def test_codex_patch_line_endings_version_gate(monkeypatch, version, expected):
 
 def test_codex_patch_line_endings_assumes_current_when_not_installed(monkeypatch):
     set_start_attr(monkeypatch, "_which_with_install_dirs", lambda _: None)
-    assert codex_agent._codex_supports_patch_line_endings() is True
+    assert codex_agent._codex_supports_patch_line_endings() is False
 
 
 def test_write_codex_config_omits_catalog_for_old_codex(tmp_path, monkeypatch):
@@ -675,6 +677,17 @@ def test_codex_warns_about_reasoning_it_cannot_express(fake_vllm, tmp_path, monk
     assert "model_reasoning_effort" not in profile
 
 
+def test_codex_carries_max_reasoning_effort(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        start.start_app, ["codex", "--url", BASE, "--no-launch", "--reasoning-effort", "max"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "--reasoning-effort" not in result.output
+    profile = (tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml").read_text()
+    assert 'model_reasoning_effort = "max"' in profile
+
+
 @pytest.mark.parametrize("mode", ["--persist", "--no-launch"])
 @pytest.mark.parametrize("agent, version", [("codex", (0, 144, 0)), ("pi", (0, 83, 0))])
 def test_agent_too_old_to_send_the_flags_warns_and_ignores(
@@ -696,6 +709,26 @@ def test_agent_too_old_to_send_the_flags_warns_and_ignores(
             tmp_path / "agents" / "codex" / f"{codex_agent._CODEX_PROFILE}.config.toml"
         ).read_text()
         assert "model_reasoning_effort" not in profile
+
+
+@pytest.mark.parametrize("extra", [[], ["--as-subagent"]])
+@pytest.mark.parametrize(
+    ("version", "should_fail"), [((0, 133, 0), True), ((0, 134, 0), False), (None, False)]
+)
+def test_codex_before_profile_file_layer_fails_early(
+    extra, version, should_fail, fake_vllm, tmp_path, monkeypatch
+):
+    # Codex < 0.134.0 reads --profile as a config.toml table, not <home>/<name>.config.toml.
+    monkeypatch.chdir(tmp_path)
+    set_start_attr(monkeypatch, "_require_agent_for_launch", lambda *args: "/bin/codex")
+    set_start_attr(monkeypatch, "_codex_executable_version", lambda executable: version)
+    set_start_attr(monkeypatch, "_launch", lambda *args, **kwargs: 0)
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, *extra])
+    if should_fail:
+        assert result.exit_code != 0
+        assert "0.134.0" in result.output
+    else:
+        assert result.exit_code == 0, result.output
 
 
 def test_session_config_codex_uses_short_ephemeral_parent(monkeypatch, tmp_path):

@@ -28,7 +28,7 @@ _SUBAGENT_INSTRUCTIONS = (
 )
 
 
-# OpenCode sends min(limit.output, this) as max_tokens unless the env var below raises it.
+# OpenCode 1 sends min(limit.output, this) as max_tokens unless the env var below raises it.
 _OPENCODE_OUTPUT_TOKEN_MAX = 32_000
 
 
@@ -56,9 +56,12 @@ class _PassthroughCommand(TyperCommand):
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Typer's help, then each epilog section as an option-style panel titled by its first
-        line."""
+        line; body lines starting with `|` form a table above the rest, the first one its header."""
         # Imported here, as Typer does, to keep rich off the CLI's startup path.
+        from rich import box
+        from rich.console import Group
         from rich.panel import Panel
+        from rich.table import Table
         from rich.text import Text
         from typer import rich_utils
 
@@ -71,9 +74,31 @@ class _PassthroughCommand(TyperCommand):
         console = rich_utils._get_rich_console()
         for section in epilog.split("\n\n"):
             title, _, body = section.partition("\n")
+            lines = body.split("\n")
+            rows = [
+                [rich_utils.highlighter(Text(cell.strip())) for cell in line.strip("|").split("|")]
+                for line in lines
+                if line.startswith("|")
+            ]
+            text = "\n".join(line for line in lines if not line.startswith("|"))
+            renderables = []
+            if rows:
+                # Rich draws the borders, so they keep the panel's style and fall back to ASCII off UTF-8.
+                table = Table(
+                    box = box.ROUNDED,
+                    border_style = rich_utils.STYLE_OPTIONS_PANEL_BORDER,
+                    show_lines = True,
+                )
+                for header in rows[0]:
+                    table.add_column(header)
+                for row in rows[1:]:
+                    table.add_row(*row)
+                renderables.append(table)
+            if text:
+                renderables.append(rich_utils.highlighter(Text.from_markup(text)))
             console.print(
                 Panel(
-                    rich_utils.highlighter(Text.from_markup(body)),
+                    Group(*renderables),
                     border_style = rich_utils.STYLE_OPTIONS_PANEL_BORDER,
                     title = title,
                     title_align = rich_utils.ALIGN_OPTIONS_PANEL,
@@ -110,7 +135,7 @@ _CONTEXT_OPTION = typer.Option(
     min = -1,
     rich_help_panel = _PANEL_MODEL,
     show_default = False,
-    help = "Set the context window in tokens; -1 keeps the server's.",
+    help = "Set the context window in tokens; see Context window.",
 )
 
 
@@ -226,7 +251,7 @@ _MAX_TOKENS_OPTION = typer.Option(
     "--max-tokens",
     min = 1,
     rich_help_panel = _PANEL_SAMPLING,
-    help = "Most tokens the agent may generate in one reply.",
+    help = "Cap one reply at N tokens; see Reply length.",
 )
 
 
@@ -353,7 +378,7 @@ _COMPACT_AT_OPTION = typer.Option(
     min = 0.5,
     max = 0.95,
     rich_help_panel = _PANEL_SESSION,
-    help = "Start the agent's auto-compaction at this fraction of the window.",
+    help = "Compact at this fraction of the window; see Auto-compaction.",
 )
 
 

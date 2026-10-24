@@ -1,6 +1,6 @@
 [project]
 name = "agent-switch"
-version = "0.1.0"
+version = "0.1.1"
 description = "Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh or its TUI) against a local OpenAI-compatible model server."
 readme = "README.md"
 license = "AGPL-3.0-only AND Apache-2.0"
@@ -28,11 +28,14 @@ packages = ["agent_switch"]
 
 [tool.hatch.build.targets.sdist]
 # TDD guardrail tests (*_tdd.py) are development by-products, not part of the source release.
-exclude = ["*_tdd.py"]
+# references/ holds upstream agent sources as submodules, for reading only.
+exclude = ["*_tdd.py", "references"]
 
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# Upstream agent sources (submodules), not ours to lint.
+extend-exclude = ["references"]
 
 [tool.ruff.lint]
 # Correctness-only rules plus unused imports. No formatter runs here, so ported files keep their

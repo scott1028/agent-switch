@@ -252,14 +252,37 @@ def test_agent_help_draws_each_epilog_section_as_a_panel():
         "Several model servers",
         "Agent arguments",
         "MCP servers",
+        "Context window",
+        "Auto-compaction",
+        "Reply length",
         "Examples",
     ):
         assert f"╭─ {title} " in result.output
 
 
+@pytest.mark.parametrize(
+    "title, rows", [("Context window", 3), ("Auto-compaction", 4), ("Reply length", 2)]
+)
+def test_agent_help_draws_each_table_panel(monkeypatch, title, rows):
+    monkeypatch.setenv("COLUMNS", "80")
+    result = CliRunner().invoke(start.start_app, ["codex", "--help"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    top = next(n for n, line in enumerate(lines) if line.startswith(f"╭─ {title} "))
+    bottom = next(n for n in range(top, len(lines)) if lines[n].startswith("╰"))
+    panel = lines[top:bottom + 1]
+    # Rich draws the nested table, so no ASCII border reaches the option highlighter.
+    assert "╭───" in panel[1] and any("╰───" in line for line in panel[2:-1])
+    # One rule under the header and one between each pair of rows.
+    assert sum("├───" in line for line in panel) == rows
+    assert "+--" not in "\n".join(panel)
+    # Every row, the nested table's included, closes at the panel's right edge.
+    assert {len(line) for line in panel} == {80}
+
+
 # The eli5 help budget: each agent subcommand stays short at 80 columns. The details live in
 # the README, so growing an option's help past this line is a deliberate change to review.
-_AGENT_HELP_MAX_LINES = 145
+_AGENT_HELP_MAX_LINES = 181
 
 
 @pytest.mark.parametrize("agent", ["claude", "codex", "opencode", "pi", "dsh"])

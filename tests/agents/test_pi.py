@@ -28,6 +28,7 @@ from tests.cli_support import (
     MODEL,
     _SESSION_FLAGS,
     _assert_env_set,
+    _assert_env_unset,
     _launch_command,
     _mcp_registry,
     _simulate_windows,
@@ -111,6 +112,17 @@ def test_pi_subagent_carries_the_session_flags(fake_vllm, tmp_path, monkeypatch)
 # ── Hermes (OpenAI /v1/chat/completions, key via env) ────────────────
 
 # ── Pi (OpenAI-compatible /v1, key in config, ~/.pi relocated via HOME) ──
+@pytest.mark.parametrize(("key", "escaped"), [("sk-a$b", "sk-a$$b"), ("!tok", "$!tok")])
+def test_pi_api_key_is_escaped_in_both_configs(tmp_path, key, escaped):
+    # Pi resolves apiKey as "$NAME" interpolation or "!command" output, so a literal key is escaped.
+    models_path = tmp_path / "models.json"
+    pi_agent.write_pi_config(BASE, key, MODEL, models_path)
+    assert json.loads(models_path.read_text())["providers"]["agent-switch"]["apiKey"] == escaped
+    subagent_path = tmp_path / "subagent.json"
+    pi_agent.write_pi_subagent_config(BASE, key, MODEL, subagent_path)
+    assert json.loads(subagent_path.read_text())["apiKey"] == escaped
+
+
 def test_write_pi_config_fresh(tmp_path):
     path = tmp_path / ".pi" / "agent" / "models.json"
     pi_agent.write_pi_config(BASE, "sk-test-abc", MODEL, path)
@@ -218,6 +230,21 @@ def _pi_user_agent_dir(tmp_path, monkeypatch) -> Path:
     return agent_dir
 
 
+@pytest.mark.parametrize("routed", [True, False])
+def test_pi_session_dir_env_is_cleared_only_for_the_url_session(routed, fake_vllm, tmp_path, monkeypatch):
+    # Pi stores sessions in $PI_CODING_AGENT_SESSION_DIR before its agent dir, which a --url
+    # session moves; native launch keeps the user's own.
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "user-sessions"))
+    args = ["pi", "--url", BASE, "--no-launch"] if routed else ["pi", "--no-launch"]
+    result = CliRunner().invoke(start.start_app, args)
+    assert result.exit_code == 0, result.output
+    if routed:
+        _assert_env_unset(result.output, "PI_CODING_AGENT_SESSION_DIR")
+    else:
+        assert "PI_CODING_AGENT_SESSION_DIR" not in result.output
+
+
 def test_connect_pi_no_launch(fake_vllm, tmp_path, monkeypatch):
     user_agent_dir = _pi_user_agent_dir(tmp_path, monkeypatch)
     (user_agent_dir / "extensions").mkdir()
@@ -309,7 +336,9 @@ def test_write_pi_user_resources_links_resources_and_keeps_config_private(tmp_pa
             # Pi matches patterns relative to the agent directory, so add a user-anchored copy.
             "!local/old.ts",
             f"!{user_agent_dir / 'local' / 'old.ts'}",
+            # Pi expands ~ in patterns against HOME, which moved, so anchor it on the user's home.
             "-~/literal.ts",
+            f"-{user_home / 'literal.ts'}",
         ],
         "skills": ["skills/*", "../shared/*", str(user_home / ".pi" / "shared" / "*")],
     }
@@ -848,6 +877,28 @@ def test_connect_pi_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
             "env": {},
         }
     }
+
+
+def test_connect_pi_mcp_json_escapes_env_and_header_values(fake_vllm, tmp_path, monkeypatch):
+    # Pi's built-in MCP resolves $NAME and a leading !command in env and header values.
+    _pi_user_agent_dir(tmp_path, monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        [
+            "pi", "--url", BASE, "--no-launch",
+            "--mcp-stdio", "ev:npx everything",
+            "--mcp-env", "ev:TOKEN=a$b",
+            "--mcp-env", "ev:CMD=!echo hi",
+            "--mcp-url", "api:http://127.0.0.1:18331/mcp",
+            "--mcp-header", "api:X-Api-Key=!tok$1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    mcp_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "mcp.json"
+    servers = json.loads(mcp_path.read_text())["mcpServers"]
+    assert servers["ev"]["env"] == {"TOKEN": "a$$b", "CMD": "$!echo hi"}
+    assert servers["ev"]["args"] == ["everything"]
+    assert servers["api"]["headers"] == {"X-Api-Key": "$!tok$$1"}
 
 
 def test_connect_pi_without_mcp_flags_writes_no_mcp_json(fake_vllm, tmp_path, monkeypatch):

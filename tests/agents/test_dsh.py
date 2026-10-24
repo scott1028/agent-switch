@@ -154,6 +154,8 @@ def test_write_dsh_patch_lists_served_models(dsh_patch):
         "low": "low",
         "medium": "medium",
         "high": "high",
+        "xhigh": "xhigh",
+        "max": "max",
     }
     # The connected entry keeps the loaded/--context-length window, not the listing's, and
     # the reasoning levels that carry the template kwargs ride on every row.
@@ -222,6 +224,18 @@ def test_dsh_command_selects_web_only_for_app_arguments(args, expected):
         ),
         (["--profile=headless", "fix"], ["dsh", "--patch", "P", "--profile=headless", "fix"]),
         (["--dump-config"], ["dsh", "--patch", "P", "--dump-config"]),
+        (
+            ["--dump-config-schema", "--profile", "mine"],
+            ["dsh", "--patch", "P", "--dump-config-schema", "--profile", "mine"],
+        ),
+        (
+            ["--from-default-profile", "web", "--profile", "mine"],
+            ["dsh", "--patch", "P", "--from-default-profile", "web", "--profile", "mine"],
+        ),
+        (
+            ["--from-default-profile=web", "--profile", "mine"],
+            ["dsh", "--patch", "P", "--from-default-profile=web", "--profile", "mine"],
+        ),
         # --patch repeats and composes in order, so a caller's own overlay lands after ours
         # and wins only on the keys it sets; the agent-switch provider stays defined.
         (
@@ -240,6 +254,19 @@ def test_dsh_command_selects_web_only_for_app_arguments(args, expected):
 )
 def test_dsh_command_places_the_patch_where_dsh_parses_it(args, expected):
     assert dsh_agent._dsh_command(args, "P") == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # --dump-config-schema prints the schema without mounting, so it boots no profile.
+        (["dsh", "--patch", "P", "--profile", "mine", "--dump-config-schema"], None),
+        (["dsh", "web", "--patch", "P", "--dump-config-schema"], None),
+        (["dsh", "--patch", "P", "--from-default-profile", "web", "--profile", "mine"], "mine"),
+    ],
+)
+def test_dsh_boot_profile_reads_every_launcher_option(command, expected):
+    assert dsh_agent._get_dsh_boot_profile(command) == expected
 
 
 def test_connect_dsh_no_launch(fake_vllm, tmp_path):
@@ -624,6 +651,36 @@ def test_connect_dsh_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
         "url": "http://127.0.0.1:18331/mcp",
         "headers": {},
     }
+
+
+@pytest.mark.parametrize("routed", [True, False])
+@pytest.mark.parametrize(("length", "should_fail"), [(32, False), (33, True)])
+def test_dsh_mcp_server_name_is_capped_at_32(routed, length, should_fail, fake_vllm, monkeypatch):
+    # dsh-mcp-client accepts only a serverName matching /^[A-Za-z0-9_-]{1,32}$/.
+    if not routed:
+        _native_no_connect_dsh(monkeypatch)
+    name = "n" * length
+    route = ["--url", BASE] if routed else []
+    result = CliRunner().invoke(
+        start.start_app,
+        ["dsh", *route, "--no-launch", "--mcp-url", f"{name}:http://127.0.0.1:18331/mcp"],
+    )
+    if should_fail:
+        assert result.exit_code == 1, result.output
+        assert name in result.output and "32" in result.output
+        assert fake_vllm == []
+    else:
+        assert result.exit_code == 0, result.output
+
+
+def test_dsh_long_registry_mcp_name_points_at_the_registry(fake_vllm):
+    # A --mcp/--mcp-all name comes from the registry, where NAME:... cannot rename it.
+    name = "n" * 33
+    registry = _mcp_registry({name: {"type": "http", "url": "http://127.0.0.1:9/mcp"}})
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp", name])
+    assert result.exit_code == 1, result.output
+    assert f"rename it in {registry}" in result.output.replace("\n", "")
+    assert fake_vllm == []
 
 
 def test_connect_dsh_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):

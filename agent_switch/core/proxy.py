@@ -155,7 +155,7 @@ def _proxy_handler(routes: dict, primary: tuple, token: str):
             given = self.headers.get("Authorization") or ""
             if given[:7].casefold() == "bearer ":
                 given = given[7:].strip()
-            # Claude Code sends x-api-key, the OpenAI SDK and Codex send the bearer; either passes.
+            # Claude Code (ANTHROPIC_AUTH_TOKEN), the OpenAI SDK and Codex send the bearer; x-api-key is accepted too.
             wanted = token.encode()
             for candidate in (given, self.headers.get("x-api-key") or ""):
                 if secrets.compare_digest(candidate.encode("utf-8", "replace"), wanted):

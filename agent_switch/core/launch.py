@@ -433,7 +433,7 @@ def _run(
     unset_env: tuple = (),
     clear_screen: bool = False,
 ) -> None:
-    # Some agents (Pi) render inline from wherever the cursor sits: their first paint assumes a clean screen rather than clearing or entering the alternate screen themselves. Hand them one so the session does not start mid-scroll under our connection output. click.clear() is cross-platform and a no-op when stdout is not a terminal, so transcripts and --no-launch recipes stay intact.
+    # Some agents (Pi with tuiMode "regular"; its default is fullscreen) render inline from wherever the cursor sits: their first paint assumes a clean screen rather than clearing or entering the alternate screen themselves. Hand them one so the session does not start mid-scroll under our connection output. click.clear() is cross-platform and a no-op when stdout is not a terminal, so transcripts and --no-launch recipes stay intact.
     if launch and clear_screen:
         click.clear()
     if _active_target.upstreams:

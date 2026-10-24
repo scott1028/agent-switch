@@ -99,14 +99,15 @@ _PI_USER_RESOURCES_MANIFEST = ".agent-switch-user-resources.json"
 _PI_SAMPLING_PARAMS_MIN_VERSION = (0, 84, 0)
 
 
-def _pi_header_values(headers: dict) -> dict:
-    """Pi resolves $NAME and !command in header values; doubling $ keeps literal values intact,
+def _pi_config_value(value: str) -> str:
+    """Pi resolves $NAME and !command in apiKey and header values; doubling $ keeps a literal value intact,
     and a leading ! is prefixed with $ so pi's $! escape makes it literal instead of a shell command."""
-    escaped = {}
-    for name, value in headers.items():
-        value = value.replace("$", "$$")
-        escaped[name] = f"${value}" if value.startswith("!") else value
-    return escaped
+    value = value.replace("$", "$$")
+    return f"${value}" if value.startswith("!") else value
+
+
+def _pi_header_values(headers: dict) -> dict:
+    return {name: _pi_config_value(value) for name, value in headers.items()}
 
 
 def _pi_model_entry(
@@ -164,7 +165,7 @@ def write_pi_config(
         "baseUrl": f"{base}/v1",
         # pi refuses the prompt without an apiKey ("No API key found for ..."); its OpenAI SDK merges
         # the custom Authorization over the Bearer later (case-insensitively), so one header wins.
-        "apiKey": key,
+        "apiKey": _pi_config_value(key),
         **({"headers": _pi_header_values(headers)} if headers else {}),
         "models": [
             _pi_model_entry(served, max_tokens, request_body, should_warn = served_id == model["id"])
@@ -238,8 +239,9 @@ def write_pi_compaction(
         _write_private_json(path, settings)
 
 
-def _write_pi_mcp_config(path: Path, servers: dict) -> None:
-    """The mounted MCP servers in pi's mcp.json shape."""
+def _write_pi_mcp_config(path: Path, servers: dict, *, should_escape: bool = False) -> None:
+    """The mounted MCP servers in pi's mcp.json shape; should_escape for pi's built-in MCP, which resolves env and header values."""
+    escape = _pi_header_values if should_escape else dict
     _write_private_json(
         path,
         {
@@ -248,10 +250,10 @@ def _write_pi_mcp_config(path: Path, servers: dict) -> None:
                     {
                         "command": server["command"],
                         "args": server["args"],
-                        "env": server["env"],
+                        "env": escape(server["env"]),
                     }
                     if server["transport"] == "stdio"
-                    else {"url": server["url"], "headers": server["headers"]}
+                    else {"url": server["url"], "headers": escape(server["headers"])}
                 )
                 for name, server in servers.items()
             }
@@ -342,9 +344,10 @@ def _pi_settings_entries(
             pattern = entry[len(prefix) :]
             if not prefix and "*" not in entry and "?" not in entry:
                 entry = _pi_local_entry(entry, source, home, linked, agents_skills)
-            elif not pattern.strip().startswith("~"):  # Pi does not expand ~ in patterns
-                # Pi matches patterns against paths relative to the agent directory, which moved.
-                # Keep the original too: it still matches basenames and linked directories.
+            else:
+                # Pi matches patterns against paths relative to the agent directory and expands ~
+                # against HOME, both of which moved. Keep the original too: it still matches
+                # basenames and linked directories.
                 anchored = prefix + _pi_local_entry(
                     pattern,
                     source,
@@ -528,7 +531,7 @@ def write_pi_subagent_config(
         path,
         {
             "baseUrl": f"{base}/v1",
-            "apiKey": key,
+            "apiKey": _pi_config_value(key),
             "model": model["id"],
             "contextWindow": window,
             "maxTokens": _agent_output_limit(window, max_tokens),
@@ -625,8 +628,9 @@ def pi(
         _require_agent_for_launch("pi", install_hint, launch)
     if target is None:
         # Native launch: pi keeps its own model, login and config (HOME and
-        # PI_CODING_AGENT_DIR untouched); mounted servers only ride --mcp-config, which pi
-        # adds to its own servers rather than replacing.
+        # PI_CODING_AGENT_DIR untouched); mounted servers only ride --mcp-config. Pi itself has
+        # no such flag and rejects it; it works only with an extension that registers the flag,
+        # such as pi-mcp-adapter.
         with _session_config("pi-native", launch) as config:
             mcp_path = config / "mcp.json"
             mcp_flags = []
@@ -717,7 +721,7 @@ def pi(
             )
         return
     served_models = _get_served_models(target, key, max_seq_length)
-    # Pi defaults to the google provider, so pin our provider/model on the command line; the custom OpenAI-compatible endpoint itself is only configurable via ~/.pi/agent/models.json.
+    # Pi starts on a saved default model, else a known provider's default, else the first available one, so pin our provider/model on the command line; the custom OpenAI-compatible endpoint itself is only configurable via ~/.pi/agent/models.json.
     command = [
         "pi",
         "--provider",
@@ -753,13 +757,14 @@ def pi(
         )
         write_pi_user_resources(pi_agent_dir, home)
         write_pi_compaction(pi_agent_dir, entry, compact_at, served_models)
-        # Pi 1.1.0's built-in MCP reads <agentDir>/mcp.json (as does the user's pi-mcp-adapter);
+        # Pi's built-in MCP (since 0.99.0) reads <agentDir>/mcp.json (as does the user's pi-mcp-adapter);
         # HOME and PI_CODING_AGENT_DIR are already the session's, so this file replaces the
         # user's own servers for the session. Without MCP flags it is removed again, so a
-        # persisted session keeps no earlier mount.
+        # persisted session keeps no earlier mount. The $$/$! escapes in env and headers are for
+        # pi's built-in MCP; an extension that replaces it, such as pi-mcp-adapter, gets them as is.
         mcp_path = pi_agent_dir / "mcp.json"
         if mcp_servers:
-            _write_pi_mcp_config(mcp_path, mcp_servers)
+            _write_pi_mcp_config(mcp_path, mcp_servers, should_escape = True)
         else:
             mcp_path.unlink(missing_ok = True)
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}
@@ -769,7 +774,7 @@ def pi(
             drive, tail = os.path.splitdrive(str(home))
             if drive:
                 env["HOMEDRIVE"], env["HOMEPATH"] = drive, tail
-        # Pi paints inline from the current cursor position (no alternate screen, no clear on first render), so give it the clean screen it assumes.
+        # Pi defaults to fullscreen since 1.0.0, but tuiMode "regular" paints inline from the cursor without clearing first, so give it a clean screen.
         _run(
             base,
             entry,
@@ -778,4 +783,6 @@ def pi(
             launch = launch,
             install_hint = install_hint,
             clear_screen = True,
+            # Pi picks this over <agentDir>/sessions, so an inherited one escapes the session home.
+            unset_env = ("PI_CODING_AGENT_SESSION_DIR",),
         )

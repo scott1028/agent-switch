@@ -110,14 +110,17 @@ with 0.14.0 on dsh 0.1.5-rc.2 and 0.2.0-rc.2) on the same route. Both names shar
 - The TUI keeps its state in `~/.dsh-tui`, so `HOME` and `USERPROFILE` move to the session folder
   together with `DSH_HOME`, and pnpm's store and cache stay inside it. Your own dsh and dsh-tui
   profiles, accounts, history and pnpm store are neither read nor written.
-- The same `AGENTS.md` and `skills/` links apply. Because `HOME` moves, `~/.agents/skills` is not
-  visible: put such skills in `~/.dsh/skills` or in the project.
+- The same `AGENTS.md` and `skills/` links apply. Because `HOME` moves, `~/.agents/skills` and
+  `~/.agents/AGENTS.md` are not visible: put such skills in `~/.dsh/skills` and such instructions
+  in `~/.dsh/AGENTS.md`, or either in the project.
 - The session folder (`~/.agent-switch/agents/dsh-tui`) is kept by default. Settings changed with
   `/settings`, the TUI's preferences, history and the installed profile survive between runs, and
   `-- --resume <id>` or `-- -c` reopen a session.
 - `--no-persist` uses a throwaway folder deleted on exit. The TUI profile is then installed with
   pnpm again on every start (about 9 s and 89 MB in testing).
-- The model stays on the agent-switch route, whatever the TUI's model picker saved.
+- The model stays on the agent-switch route, whatever the TUI's model picker saved: each run of
+  agent-switch drops the saved `/model` pick. A `--no-launch` recipe you reuse later keeps a pick
+  made in between; run agent-switch again to drop it.
 - It needs an interactive terminal. `--no-launch` prints the command; on Linux and macOS, its last
   line clears the TUI's inherited handoff variables with `env -u`.
 
@@ -125,9 +128,10 @@ Limits:
 
 - The session is pinned to the dsh backend and the agent-switch model route. These are refused:
   `--profile`, `--from-default-profile`, a `--backend` other than `dsh`, `--compact-at` (the TUI's
-  agent presets own compaction), `--as-subagent`, and the launcher's own `update`, `migrate`,
-  `doctor`, `safe`, `version` and `help` commands. To send such a word as a prompt, put it after
-  `-- --`. Switching the kernel inside the TUI leaves the route.
+  agent presets own compaction), `--as-subagent`, the launcher's own `update`, `migrate`,
+  `doctor`, `safe`, `version` and `help` commands, and its CLI commands `cli`, `run`, `-p`,
+  `--print`, `session`, `models`, `skills`, `mcp`, `auth`, `capabilities` and `dsh`. To send such a
+  word as a prompt, put it after `-- --`. Switching the kernel inside the TUI leaves the route.
 - A `--patch` you pass is applied after agent-switch's and replaces whole config blocks, so it can
   override the route. A `dsh-tui` row in it must restate `provider`, `model`, `backend` and the
   `preset`/`workspace`/`sessionId` bindings. agent-switch warns when one is passed.
@@ -237,6 +241,7 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
   each agent's own behavior.
   - Claude Code applies the fraction to its own effective window (the window minus its output
     reserve), so it can only start compaction earlier than its built-in trigger, never later.
+  - Codex caps it at 0.9 of the window, so a value above 0.9 acts as 0.9.
   - DeepSeek Harness applies it only to its headless profile (`--profile headless`). Its web profile
     ignores it, and agent-switch warns before starting it.
 
@@ -245,7 +250,7 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 - `--reasoning on|off` overrides the model's chat template for this session.
 - `--reasoning-effort <level>` picks a thinking level. The levels are the model's own, so pass one
   its chat template accepts. Unset keeps the template's choice.
-- OpenCode also gets `none/low/medium/high/xhigh` effort variants for every model
+- OpenCode also gets `none/low/medium/high/xhigh/max` effort variants for every model
   (`provider/model#xhigh` in its model picker). On OpenCode 2.x a pinned `--reasoning-effort` wins
   over a chosen variant; on 1.x the variant wins.
 - `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty` and `--presence-penalty`
@@ -280,7 +285,7 @@ receives them its own way, and agent-switch writes only into its own session fol
 | Claude Code | `--mcp-config=<session>/mcp.json` (the `=` form, no `--strict-mcp-config`) |
 | Codex | `-c mcp_servers.<name>=<inline table>` per server; a stdio `env` rides a private 0700 wrapper script, an http header value a uniquely named `AGENT_SWITCH_MCP_HDR_<n>` process env var, so no secret reaches argv |
 | OpenCode | `OPENCODE_CONFIG=<session>/opencode.json` holding only `$schema` and `mcp` |
-| Pi | `--mcp-config <session>/mcp.json` |
+| Pi | `--mcp-config <session>/mcp.json`; pi itself has no such flag and rejects it, so this needs an extension that registers it, such as `pi-mcp-adapter` |
 | dsh, dsh-tui, dst | `--patch <session>/agent-switch.patch.yml` with only the MCP `insert` row; without MCP flags, no patch at all |
 
 Native launch always uses a temporary session folder. `--no-launch` uses a fixed
@@ -387,7 +392,8 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   session. (Native launch adds them instead; see [Native launch](#native-launch).)
 - Claude Code gets `--strict-mcp-config --mcp-config=<session file>`. Codex, OpenCode, Pi and dsh get
   them through their isolated session config; OpenCode also copies the servers from your global
-  config that are not mounted, with `enabled: false`.
+  config that are not mounted, with `enabled: false` (OpenCode 2's `mcp.servers` with
+  `disabled: true`; OpenCode 2 reads its global config from `OPENCODE_CONFIG_DIR` when set).
 - MCP config inside the project you start from may still load: OpenCode's project `opencode.json`
   outranks the session overlay, for example.
 - An `oauth: true` http server is mounted through the pinned `mcp-remote` (needs `npx`). It signs in

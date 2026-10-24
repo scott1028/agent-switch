@@ -72,6 +72,19 @@ def test_opencode_command_finds_official_v2_install_dir(monkeypatch, tmp_path):
     assert opencode_agent._opencode_command() == (str(install_dir / "opencode2"), True)
 
 
+@pytest.mark.parametrize(
+    ("version", "expected_v2"),
+    [("2.1.4", True), ("opencode 2.0.0", True), ("1.17.12", False), ("development build", False)],
+)
+def test_opencode_command_detects_v2_installed_as_opencode(monkeypatch, version, expected_v2):
+    # Homebrew and the Arch package install OpenCode 2 as plain `opencode`, with no opencode2.
+    monkeypatch.setattr(shutil, "which",
+        lambda name, path = None: "/usr/local/bin/opencode" if name == "opencode" else None,
+    )
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: version)
+    assert opencode_agent._opencode_command() == ("opencode", expected_v2)
+
+
 def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
     installs = []
     set_start_attr(monkeypatch, "_which_with_install_dirs", lambda _: None)
@@ -87,6 +100,22 @@ def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
     assert result.exit_code == 1
     assert len(installs) == 1
     assert installs[0][0] == "opencode"
+
+
+def test_opencode_v2_install_hint_names_the_v2_package(monkeypatch):
+    hints = []
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+
+    def require(name, hint, launch):
+        hints.append(hint)
+        raise RuntimeError("stop after the install hint")
+
+    set_start_attr(monkeypatch, "_require_agent_for_launch", require)
+
+    result = CliRunner().invoke(start.start_app, ["opencode", "--provider", "vllm"])
+
+    assert result.exit_code == 1
+    assert hints[0].endswith("@opencode/cli@latest")
 
 
 def test_opencode_no_launch_resolves_generation_without_installing(monkeypatch):
@@ -166,6 +195,23 @@ def test_opencode_session_temperature_needs_the_capability(fake_vllm, tmp_path, 
         assert provider["models"][MODEL["id"]].get("temperature") is capability
 
 
+@pytest.mark.parametrize(
+    ("extra", "session"), [([], "opencode"), (["--as-subagent"], "opencode-subagent")]
+)
+def test_opencode_v2_omits_the_temperature_capability(extra, session, fake_vllm, tmp_path, monkeypatch):
+    # OpenCode 2 reports models.<id>.temperature as an unsupported legacy setting.
+    monkeypatch.chdir(tmp_path)
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--temperature", "0.3", *extra]
+    )
+    assert result.exit_code == 0, result.output
+    config_path = tmp_path / "agents" / session / "opencode.json"
+    provider = json.loads(config_path.read_text())["provider"][opencode_agent._OPENCODE_PROVIDER]
+    assert "temperature" not in provider["models"][MODEL["id"]]
+    assert provider["options"]["body"]["temperature"] == 0.3
+
+
 def test_session_carries_the_custom_header_to_the_agent(fake_vllm, tmp_path, monkeypatch):
     # A custom Authorization wins over the API key on agent-switch's own requests too, so the
     # agent config must carry it and drop the apiKey it no longer sends.
@@ -203,7 +249,7 @@ def test_opencode_v1_reads_the_effort_as_reasoning_effort_option(
 # title request free of it.
 _OPENCODE_EFFORT_VARIANTS = {
     "none": {},
-    **{name: {"reasoningEffort": name} for name in ("low", "medium", "high", "xhigh")},
+    **{name: {"reasoningEffort": name} for name in ("low", "medium", "high", "xhigh", "max")},
 }
 
 
@@ -211,7 +257,7 @@ def test_opencode_model_entry_gets_the_effort_variants():
     entry = opencode_agent._opencode_model_entry(MODEL)
     assert entry["variants"] == _OPENCODE_EFFORT_VARIANTS
     # The empty none must come first: OpenCode's title request falls back to the first variant.
-    assert list(entry["variants"]) == ["none", "low", "medium", "high", "xhigh"]
+    assert list(entry["variants"]) == ["none", "low", "medium", "high", "xhigh", "max"]
 
 
 def test_opencode_provider_variants_cover_every_served_model():
@@ -357,6 +403,20 @@ def test_opencode_max_tokens_recipe_keeps_a_larger_inherited_ceiling(fake_vllm, 
     )
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "100000")
+
+
+def test_opencode_v2_max_tokens_sets_no_output_env(fake_vllm, tmp_path, monkeypatch):
+    # OpenCode 2 never reads the env var; it sends limit.output, up to 256k.
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+    monkeypatch.setenv("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "8000")
+    result = CliRunner().invoke(
+        start.start_app, ["opencode", "--url", BASE, "--no-launch", "--max-tokens", "65536"]
+    )
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    limit = config["provider"][opencode_agent._OPENCODE_PROVIDER]["models"][MODEL["id"]]["limit"]
+    assert limit["output"] == 65536
+    assert "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX" not in result.output
 
 
 def test_opencode_max_tokens_past_half_the_window_is_capped(fake_vllm, tmp_path):
@@ -667,6 +727,40 @@ def test_connect_opencode_v2_models_uses_private_server(fake_vllm, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["opencode2", "models", "--standalone"]
+
+
+@pytest.mark.parametrize("subcommand", ["upgrade", "update", "uninstall", "reload"])
+def test_opencode_v2_registered_subcommands_are_not_tui_paths(subcommand):
+    assert opencode_agent._opencode_v2_standalone_args([subcommand]) == [subcommand]
+    assert opencode_agent._opencode_native_auto_args([subcommand], True, v2 = True) == (
+        [subcommand],
+        False,
+    )
+
+
+@pytest.mark.parametrize("subcommand", ["session", "stats"])
+def test_opencode_v2_server_subcommands_use_the_private_server(subcommand):
+    # They take --standalone (ServerFlags); without it the background service, which lacks the
+    # session config, would answer them.
+    assert opencode_agent._opencode_v2_standalone_args([subcommand, "x"]) == [
+        subcommand,
+        "--standalone",
+        "x",
+    ]
+    assert opencode_agent._opencode_native_auto_args([subcommand], True, v2 = True) == (
+        [subcommand],
+        False,
+    )
+
+
+@pytest.mark.parametrize("path", ["console", "export", "import"])
+def test_opencode_v2_unregistered_names_are_tui_paths(path):
+    # OpenCode 2 has no top-level console/export/import; export/import moved under `session`.
+    assert opencode_agent._opencode_v2_standalone_args([path]) == [path, "--standalone"]
+    assert opencode_agent._opencode_native_auto_args([path], True, v2 = True) == (
+        [path, "--auto"],
+        True,
+    )
 
 
 def test_connect_opencode_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, monkeypatch):
@@ -1342,6 +1436,107 @@ def test_opencode_global_mcp_from_two_files_both_disabled(fake_vllm, tmp_path, m
         "url": "http://127.0.0.1:9/mcp",
         "enabled": False,
     }
+
+
+def test_opencode_v2_disables_native_global_mcp_servers(fake_vllm, tmp_path, monkeypatch):
+    # OpenCode 2 keeps servers under mcp.servers (off with disabled: true) and takes its global
+    # dir from OPENCODE_CONFIG_DIR first; a later document replaces a server whole.
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+    global_dir = tmp_path / "custom-config"
+    global_dir.mkdir()
+    (global_dir / "opencode.json").write_text(json.dumps({"mcp": {
+        "timeout": {"startup": 5000},
+        "servers": {
+            "native-server": {"type": "remote", "url": "http://127.0.0.1:9/mcp"},
+            "context7": {"type": "remote", "url": "http://127.0.0.1:9/other"},
+        },
+        "legacy-server": {"type": "local", "command": ["true"]},
+    }}))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(global_dir))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["servers"] == {
+        "native-server": {"type": "remote", "url": "http://127.0.0.1:9/mcp", "disabled": True},
+    }
+    assert config["mcp"]["legacy-server"] == {"type": "local", "command": ["true"], "enabled": False}
+    assert config["mcp"]["context7"]["enabled"] is True
+    assert "timeout" not in config["mcp"]
+
+
+@pytest.mark.parametrize("v2", [True, False])
+def test_opencode_v2_refuses_a_mounted_server_named_servers(v2, fake_vllm, tmp_path, monkeypatch):
+    # OpenCode 2 reads an untyped mcp.servers as its native map, which our overlay may need.
+    set_start_attr(monkeypatch, "_opencode_command",
+        lambda *_: ("opencode2", True) if v2 else ("opencode", False),
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    result = CliRunner().invoke(
+        start.start_app,
+        ["opencode", "--url", BASE, "--no-launch", "--mcp-url", "servers:http://127.0.0.1:9/mcp"],
+    )
+    if v2:
+        assert result.exit_code == 1, result.output
+        assert "servers" in result.output and "another name" in result.output
+    else:
+        assert result.exit_code == 0, result.output
+
+
+def test_opencode_v2_global_server_named_servers_stays_on_with_a_warning(
+    fake_vllm, tmp_path, monkeypatch
+):
+    # A typed global server named servers and the native map cannot share one overlay document.
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "opencode.json").write_text(
+        json.dumps({"mcp": {"servers": {"type": "local", "command": ["true"]}}})
+    )
+    (global_dir / "opencode.jsonc").write_text(json.dumps({"mcp": {
+        "servers": {"native-server": {"type": "remote", "url": "http://127.0.0.1:9/mcp"}},
+    }}))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert config["mcp"]["servers"] == {
+        "native-server": {"type": "remote", "url": "http://127.0.0.1:9/mcp", "disabled": True},
+    }
+    assert "named 'servers' stays enabled" in result.output
+
+
+def test_opencode_v2_ignores_the_1x_config_json(fake_vllm, tmp_path, monkeypatch):
+    # OpenCode 2 loads only opencode.json and opencode.jsonc from its global dir.
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "config.json").write_text(
+        json.dumps({"mcp": {"old-server": {"type": "local", "command": ["true"]}}})
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert list(config["mcp"]) == ["context7"]
+
+
+def test_opencode_v1_writes_no_native_mcp_servers(fake_vllm, tmp_path, monkeypatch):
+    # OpenCode 1 has no mcp.servers map, so a V2-shaped global config adds no "servers" entry.
+    global_dir = tmp_path / "xdg" / "opencode"
+    global_dir.mkdir(parents = True)
+    (global_dir / "opencode.json").write_text(json.dumps({"mcp": {
+        "servers": {"native-server": {"type": "remote", "url": "http://127.0.0.1:9/mcp"}},
+    }}))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    _mcp_registry()
+    result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch", "--mcp", "context7"])
+    assert result.exit_code == 0, result.output
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    assert list(config["mcp"]) == ["context7"]
 
 
 def test_opencode_jsonc_comment_marker_in_string_survives(fake_vllm, tmp_path, monkeypatch):

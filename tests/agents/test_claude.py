@@ -120,6 +120,8 @@ def test_claude_settings_overlay_pins_local_routing_and_auth():
     assert overlay["env"]["CLAUDE_CODE_TOTAL_TOKENS_REMINDER"] == "off"
     # Subagents fall through to the served model instead of a user's opus/sonnet pin.
     assert overlay["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "inherit"
+    # Since 2.1.251 an agent's `model:` outranks it unless forced.
+    assert overlay["env"]["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
 
 
 def test_claude_settings_files_preserve_concurrent_sessions(tmp_path):

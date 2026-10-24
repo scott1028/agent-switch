@@ -53,7 +53,8 @@ start_app = typer.Typer(
 # Each \n\n-separated section is "title\nbody"; _PassthroughCommand.format_help draws it as an
 # option-style panel. Body lines keep their newlines and indentation and stay within 76 columns,
 # the panel's inner width at 80. Rich markup tags only start lowercase/#//@, so the [NAME:]
-# metavars below are never read as markup.
+# metavars below are never read as markup. Leading `| a | b` lines become a table, the first one
+# its header.
 _MCP_EPILOG = (
     "Native launch\n"
     "Without --url/--provider the agent runs on its own model, login and config;\n"
@@ -74,6 +75,24 @@ _MCP_EPILOG = (
     "--mcp NAME / --mcp-all mount its entries; --mcp-url, --mcp-oauth-url\n"
     "and --mcp-stdio mount one-off servers, named by NAME: for --mcp-header\n"
     "and --mcp-env. With --url/--provider they replace the agent's own.\n\n"
+    "Context window\n"
+    "| --context-length | window the agent gets\n"
+    "| unset | the server's, at most 250,000 (250,000 if none)\n"
+    "| N | N; Ollama and LM Studio load at N, others need >= N\n"
+    "| -1 | the server's, uncapped (the agent's default if none)\n\n"
+    "Auto-compaction\n"
+    "| agent | without --compact-at\n"
+    "| claude | at 90% of the window minus the reply reserve\n"
+    "| opencode | keeps max(window/10, 8,192) free, at most the reply cap\n"
+    "| codex, pi, dsh | the agent's own default\n"
+    "| dsh-tui, dst | its agent presets; --compact-at is refused\n"
+    "--compact-at R compacts at R of the window (claude: minus the reply\n"
+    "reserve); R is 0.5-0.95, and dsh uses it only with --profile headless.\n\n"
+    "Reply length\n"
+    "| agent | --max-tokens N | unset\n"
+    "| opencode, pi, dsh | N, at most window/2 | window/4, at most 32,000\n"
+    "| claude, codex | not available | the agent's own limit\n"
+    "window = --context-length, else the server's (at most 250,000)\n\n"
     "Examples\n"
     "agent-switch claude --mcp context7\n"
     "agent-switch codex --yolo -- --search\n"

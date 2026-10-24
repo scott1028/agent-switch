@@ -132,6 +132,7 @@ def _claude_settings_overlay(
         {
             "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
             "CLAUDE_CODE_SUBAGENT_MODEL": "inherit",
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
         }
     )
     return json.dumps(

@@ -155,6 +155,17 @@ def test_first_run_gates_are_seeded_once_in_the_session_home(fake_vllm, tmp_path
     assert json.loads((state / "home.json").read_text()) == {"seen": True, "kept": 1}
 
 
+@pytest.mark.parametrize("agent", ["dsh-tui", "dst"])
+def test_saved_model_pick_is_dropped_so_the_route_wins(agent, fake_vllm, tmp_path):
+    # dsh-tui's last-used rule lets a persisted /model pick override the patch row's route.
+    state = _home(tmp_path) / ".dsh-tui"
+    state.mkdir(parents = True)
+    (state / "model.json").write_text('{"provider": "deepseek-official", "model": "deepseek-chat"}')
+    assert _invoke(agent, "--url", BASE, "--no-launch").exit_code == 0
+    assert not (state / "model.json").exists()
+    assert (state / "onboarding.json").exists()
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     [
@@ -181,6 +192,25 @@ def test_rejected_before_any_server_traffic(args, message, fake_vllm):
     assert result.exit_code == 1, result.output
     assert message in result.output
     assert "is not an agent-switch argument" not in result.output
+    assert fake_vllm == []
+
+
+@pytest.mark.parametrize(
+    ("command", "kind"),
+    [
+        *[
+            (name, "CLI")
+            for name in "cli run -p --print session models skills mcp auth capabilities dsh".split()
+        ],
+        ("update", "maintenance"),
+    ],
+)
+def test_launcher_commands_are_refused_by_kind(command, kind, fake_vllm):
+    # bin/dsh-tui.js reads these only as the first argument; behind our leading --patch a CLI
+    # command would become TUI prompt text instead.
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--", command, "x")
+    assert result.exit_code == 1, result.output
+    assert f"`{command}` is a dsh-tui {kind} command" in result.output
     assert fake_vllm == []
 
 

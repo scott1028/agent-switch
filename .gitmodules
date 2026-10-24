@@ -1,0 +1,30 @@
+[submodule "claude-code"]
+	path = references/claude-code
+	url = https://github.com/anthropics/claude-code
+	shallow = true
+	branch = main
+[submodule "codex"]
+	path = references/codex
+	url = https://github.com/openai/codex
+	shallow = true
+	branch = main
+[submodule "opencode"]
+	path = references/opencode
+	url = https://github.com/anomalyco/opencode
+	shallow = true
+	branch = dev
+[submodule "pi"]
+	path = references/pi
+	url = https://github.com/earendil-works/pi
+	shallow = true
+	branch = main
+[submodule "deepseek-harness"]
+	path = references/deepseek-harness
+	url = https://github.com/deepseek-ai/deepseek-harness
+	shallow = true
+	branch = master
+[submodule "dsh-tui"]
+	path = references/dsh-tui
+	url = https://github.com/ccch1mneyyy/dsh-TUI
+	shallow = true
+	branch = main
