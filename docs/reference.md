@@ -152,6 +152,9 @@ Limits:
 - To resume, run `agent-switch dsh-tui -- --resume <id>`. The TUI's own exit hint runs `dsh`
   directly, outside agent-switch.
 
+If dsh or dsh-tui stops at start with "No usable native binding found", see
+[Troubleshooting](troubleshooting.md#dsh-and-dst-crash-with-no-usable-native-binding-found).
+
 ### Headers
 
 `--header [SERVER:]NAME=VALUE` (repeat it) adds an HTTP header to every request sent to the model

@@ -183,6 +183,7 @@ When changing the version, run `uv lock` and commit the updated `uv.lock` too.
 ## More details
 
 - [Full reference](docs/reference.md): agent aliases, session behavior, MCP, and model options.
+- [Troubleshooting](docs/troubleshooting.md): problems we have hit and how we fixed them.
 - [Origin and upstream porting](docs/reference.md#origin-and-porting-from-upstream).
 
 Based on `unsloth start` from [unslothai/unsloth](https://github.com/unslothai/unsloth).
