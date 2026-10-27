@@ -136,6 +136,52 @@ def _capture_launch(monkeypatch, argv):
     return captured
 
 
+def _assert_windows_agent_copies_injected_skills(fake_vllm, tmp_path, monkeypatch, agent, command_name, is_routed):
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
+    monkeypatch.setenv("CODEX_HOME", str(user_home / ".codex"))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(user_home / ".pi" / "agent"))
+    set_start_attr(monkeypatch, "_wsl_windows_executable",
+        lambda command: f"/mnt/c/npm/{command_name}.cmd" if command[0] == command_name else None,
+    )
+    set_start_attr(monkeypatch, "_wsl_windows_path", str)
+    set_start_attr(monkeypatch, "_opencode_command", lambda: (command_name, command_name == "opencode2"))
+    source = tmp_path / "source"
+    (source / "scripts").mkdir(parents = True)
+    original = "---\nname: shared\n---\nINJECTED\n"
+    (source / "SKILL.md").write_text(original)
+    (source / "scripts" / "run.py").write_text("print('injected')\n")
+    (source / "notes.txt").write_text("Notes.\n")
+    args = [agent, *( ["--url", BASE] if is_routed else [] ), "--no-launch"]
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
+    assert result.exit_code == 0, result.output
+    session = tmp_path / "agents" / (agent if is_routed else f"{agent}-native")
+    root = session / {
+        "claude": "agent-switch/.claude/skills", "codex": "skills" if is_routed else "home/skills",
+        "opencode": "skills", "pi": ".pi/agent/skills" if is_routed else "agent/skills",
+    }[agent]
+    for name in ["shared", "renamed"]:
+        entry = root / name
+        assert entry.is_dir() and not entry.is_symlink()
+        assert all(not child.is_symlink() for child in entry.rglob("*"))
+        assert (entry / "SKILL.md").read_text() == original.replace("name: shared", f"name: {name}")
+        assert (entry / "scripts" / "run.py").read_text() == "print('injected')\n"
+        assert (entry / "notes.txt").read_text() == "Notes.\n"
+    note = f"Note: {command_name} runs as a Windows program, so injected skills are copied; restart to pick up edits."
+    assert result.output.splitlines().count(note) == 1
+    assert (source / "SKILL.md").read_text() == original
+    assert (source / "scripts" / "run.py").read_text() == "print('injected')\n"
+    replaced = CliRunner().invoke(start.start_app, [*args, "--skill", f"replacement:{source}"])
+    assert replaced.exit_code == 0, replaced.output
+    assert not (root / "shared").exists() and not (root / "renamed").exists()
+    assert (root / "replacement").is_dir() and not (root / "replacement").is_symlink()
+    cleared = CliRunner().invoke(start.start_app, args)
+    assert cleared.exit_code == 0, cleared.output
+    assert note not in cleared.output
+
+
 # One stdio and one http server, the http header carrying a ${VAR} so a test can prove the
 # expanded secret reaches only the private session file, never the printed recipe.
 _MCP_SERVERS = {

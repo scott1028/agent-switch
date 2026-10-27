@@ -27,6 +27,7 @@ from tests.cli_support import (
     KEY,
     MODEL,
     _assert_env_set,
+    _assert_windows_agent_copies_injected_skills,
     _capture_launch,
     _launch_command,
     _mcp_registry,
@@ -34,6 +35,45 @@ from tests.cli_support import (
     _path_aware_which,
 )
 from tests.start_split import set_start_attr
+
+
+@pytest.mark.parametrize("command_name", ["opencode", "opencode2"])
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_windows_opencode_copies_injected_skills(fake_vllm, tmp_path, monkeypatch, command_name, is_routed):
+    _assert_windows_agent_copies_injected_skills(
+        fake_vllm, tmp_path, monkeypatch, "opencode", command_name, is_routed
+    )
+
+
+def _get_skill_snapshot(root):
+    return {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
+            for path in root.rglob("*")}
+
+
+@pytest.fixture
+def opencode_skill_sources(tmp_path, monkeypatch):
+    home = tmp_path / "user-home"
+    config_home = home / ".config"
+    directory = config_home / "opencode"
+    for root in [directory / "skills", home / ".claude" / "skills", home / ".agents" / "skills"]:
+        (root / "shared").mkdir(parents = True)
+        (root / "shared" / "SKILL.md").write_text("---\nname: shared\n---\nUSER\n")
+    (directory / "opencode.json").write_text(json.dumps({
+        "model": "user-provider/user-model", "skills": {"paths": [str(directory / "skills")]},
+        "mcp": {"user-server": {"type": "local", "command": ["true"], "enabled": True}},
+    }))
+    source = tmp_path / "skill sources" / "shared"
+    source.mkdir(parents = True)
+    (source / "SKILL.md").write_text("---\nname: shared\n---\nINJECTED\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising = False)
+    before_home = _get_skill_snapshot(home)
+    before_source = _get_skill_snapshot(source)
+    yield source
+    assert _get_skill_snapshot(home) == before_home
+    assert _get_skill_snapshot(source) == before_source
 
 
 def test_opencode_native_auto_probes_old_opencode_only_in_install_dir(monkeypatch, tmp_path):
@@ -1622,3 +1662,110 @@ def test_native_opencode_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", *flag])
     assert result.exit_code == 1
     assert "needs --url or --provider" in result.output
+
+
+@pytest.mark.parametrize("is_v2", [False, True])
+@pytest.mark.parametrize("has_mcp", [False, True])
+def test_native_opencode_skill_config_mounts_and_clears(fake_vllm, tmp_path, monkeypatch, opencode_skill_sources, is_v2, has_mcp):
+    source = opencode_skill_sources
+    _native_no_connect(monkeypatch)
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2" if is_v2 else "opencode", is_v2))
+    args = ["opencode", "--no-launch"]
+    baseline = CliRunner().invoke(start.start_app, args)
+    assert baseline.exit_code == 0, baseline.output
+    assert "OPENCODE_CONFIG" not in baseline.output
+    cfg = tmp_path / "agents" / "opencode-native"
+    assert not (cfg / "skills").exists()
+    result = CliRunner().invoke(start.start_app, [
+        *args, "--skill", str(source), "--skill", f"renamed:{source}",
+        *(["--mcp-stdio", "ev:npx everything"] if has_mcp else []),
+    ])
+    assert result.exit_code == 0, result.output
+    _assert_env_set(result.output, "OPENCODE_CONFIG", str(cfg / "opencode.json"))
+    config = json.loads((cfg / "opencode.json").read_text())
+    assert set(config) == {"$schema", "skills", *(["mcp"] if has_mcp else [])}
+    assert config["skills"] == {"paths": [str(cfg / "skills")]}
+    if has_mcp:
+        assert config["mcp"]["ev"]["command"] == ["npx", "everything"]
+    assert (cfg / "skills" / "shared").resolve() == source
+    assert (cfg / "skills" / "shared").is_symlink()
+    assert not (cfg / "skills" / "renamed").is_symlink()
+    assert "name: renamed\n" in (cfg / "skills" / "renamed" / "SKILL.md").read_text()
+    assert _launch_command(result.output) == _launch_command(baseline.output)
+    cleared = CliRunner().invoke(start.start_app, args)
+    assert cleared.exit_code == 0, cleared.output
+    assert "OPENCODE_CONFIG" not in cleared.output
+    assert not (cfg / "opencode.json").exists()
+    assert not os.path.lexists(cfg / "skills" / "shared")
+    assert not (cfg / "skills" / "renamed").exists()
+
+
+@pytest.mark.parametrize("is_v2", [False, True])
+@pytest.mark.parametrize("should_persist", [False, True])
+def test_routed_opencode_skills_clear_on_rerun(fake_vllm, tmp_path, monkeypatch, opencode_skill_sources, is_v2, should_persist):
+    source = opencode_skill_sources
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2" if is_v2 else "opencode", is_v2))
+    args = ["opencode", "--url", BASE, "--no-launch", *(["--persist"] if should_persist else [])]
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
+    assert result.exit_code == 0, result.output
+    cfg = tmp_path / "agents" / "opencode"
+    config_path = cfg / "opencode.json"
+    config = json.loads(config_path.read_text())
+    assert config["skills"] == {"paths": [str(cfg / "skills")]}
+    assert (cfg / "skills" / "shared").is_symlink()
+    assert (cfg / "skills" / "shared").resolve() == source
+    assert not (cfg / "skills" / "renamed").is_symlink()
+    assert "name: renamed\n" in (cfg / "skills" / "renamed" / "SKILL.md").read_text()
+    cleared = CliRunner().invoke(start.start_app, args)
+    assert cleared.exit_code == 0, cleared.output
+    assert "skills" not in json.loads(config_path.read_text())
+    assert not os.path.lexists(cfg / "skills" / "shared")
+    assert not (cfg / "skills" / "renamed").exists()
+    assert _launch_command(cleared.output) == _launch_command(result.output)
+
+
+def test_native_opencode_alias_carries_skill_config(fake_vllm, tmp_path, monkeypatch, opencode_skill_sources):
+    _native_no_connect(monkeypatch)
+    set_start_attr(monkeypatch, "_check_alias", lambda alias: None)
+    result = CliRunner().invoke(start.start_app, [
+        "opencode-personal", "--no-launch", "--skill", str(opencode_skill_sources), "--", "run", "hello",
+    ])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == [
+        "bash", "-ic", 'opencode-personal "$@"', "agent-switch", "run", "hello",
+    ]
+    cfg = tmp_path / "agents" / "opencode-native"
+    _assert_env_set(result.output, "OPENCODE_CONFIG", str(cfg / "opencode.json"))
+    assert json.loads((cfg / "opencode.json").read_text())["skills"] == {"paths": [str(cfg / "skills")]}
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_opencode_skill_refuses_subagent_before_connect(fake_vllm, monkeypatch, opencode_skill_sources, is_routed):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, [
+        "opencode", *(["--url", BASE] if is_routed else []), "--as-subagent", "--no-launch",
+        "--skill", str(opencode_skill_sources),
+    ])
+    assert result.exit_code == 1
+    assert "--skill cannot be combined with --as-subagent." in result.output
+    assert fake_vllm == []
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_opencode_skill_paths_use_selected_command_for_translation(fake_vllm, tmp_path, monkeypatch, opencode_skill_sources, is_routed):
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode2", True))
+    calls = []
+    translated = r"C:\Users\test user\session\skills"
+
+    def translate(path, command):
+        calls.append((path, command))
+        return translated
+
+    monkeypatch.setattr(opencode_agent, "_agent_config_path", translate)
+    result = CliRunner().invoke(start.start_app, [
+        "opencode", *(["--url", BASE] if is_routed else []), "--no-launch", "--skill", str(opencode_skill_sources),
+    ])
+    assert result.exit_code == 0, result.output
+    cfg = tmp_path / "agents" / ("opencode" if is_routed else "opencode-native")
+    assert json.loads((cfg / "opencode.json").read_text())["skills"] == {"paths": [translated]}
+    assert calls == [(cfg / "skills", ["opencode2"])]

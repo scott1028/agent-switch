@@ -59,6 +59,7 @@ from agent_switch.core.options import (
     _REASONING_EFFORT_OPTION,
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
+    _SKILL_OPTION,
     _SUBAGENT_DESCRIPTION,
     _SUBAGENT_INSTRUCTIONS,
     _TEMPERATURE_OPTION,
@@ -73,7 +74,9 @@ from agent_switch.core.options import (
     _refuse_local_only,
     opencode_output_limit,
 )
+from agent_switch.core.platform import _wsl_windows_executable
 from agent_switch.core.session import _agent_config_path, _session_config
+from agent_switch.core.skills import load_skills, write_skills
 from agent_switch.core.storage import _read_json_object, _subdict, _write_private_json
 from agent_switch.providers.utils import get_has_custom_authorization
 
@@ -532,6 +535,7 @@ def write_opencode_config(
     mcp_servers: Optional[dict] = None,
     served_models: Optional[list] = None,
     v2: bool = False,
+    skills_root: Optional[str] = None,
 ) -> dict:
     config = _read_json_object(path)
     if config is None:
@@ -554,6 +558,10 @@ def write_opencode_config(
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = _opencode_provider(
         base, key, model, max_tokens, request_body, headers, served_models, v2
     )
+    if skills_root is None:
+        config.pop("skills", None)
+    else:
+        config["skills"] = {"paths": [str(skills_root)]}
     # --mcp/--mcp-all rewrite the mcp map every run: mounted servers win by name in this
     # overlay, and every unmounted entry of the user's global config is copied with
     # enabled: false, or disabled: true under OpenCode 2's mcp.servers (this layer cannot
@@ -668,6 +676,7 @@ def opencode(
     mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
+    skill: Optional[list[str]] = _SKILL_OPTION,
 ):
     """Point OpenCode at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -681,6 +690,7 @@ def opencode(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
+    skills = load_skills(skill, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(
@@ -711,9 +721,14 @@ def opencode(
         _check_alias(alias)
     else:
         _require_agent_for_launch(command_name, install_hint, launch)
+    should_copy_skills = bool(skills and _wsl_windows_executable([command_name]))
+    if should_copy_skills:
+        typer.echo(
+            f"Note: {command_name} runs as a Windows program, so injected skills are copied; "
+            "restart to pick up edits."
+        )
     if target is None:
-        # Native launch: opencode keeps its own model, login and config; the session config
-        # carries only the mounted MCP servers, and OPENCODE_CONFIG is the only env change.
+        # Native model and login stay unchanged; session MCP and skills ride OPENCODE_CONFIG.
         route_native_auto = yolo and _opencode_supports_native_auto(command_name)
         opencode_args = list(ctx.args)
         if opencode_v2:
@@ -725,14 +740,15 @@ def opencode(
         with _session_config("opencode-native", launch) as cfg:
             env = {}
             config_path = cfg / "opencode.json"
-            if mcp_servers:
-                _write_private_json(
-                    config_path,
-                    {
-                        "$schema": "https://opencode.ai/config.json",
-                        "mcp": _opencode_mcp_entries(mcp_servers),
-                    },
-                )
+            skills_root = cfg / "skills"
+            write_skills(skills_root, skills, should_copy = should_copy_skills)
+            if mcp_servers or skills:
+                config = {"$schema": "https://opencode.ai/config.json"}
+                if mcp_servers:
+                    config["mcp"] = _opencode_mcp_entries(mcp_servers)
+                if skills:
+                    config["skills"] = {"paths": [_agent_config_path(skills_root, [command_name])]}
+                _write_private_json(config_path, config)
                 env["OPENCODE_CONFIG"] = str(config_path)
             else:
                 # Stable --no-launch dir: drop an earlier mount so a bare rerun stays native.
@@ -865,6 +881,8 @@ def opencode(
     # opencode keeps sessions in ~/.local/share/opencode (never relocated), so resume already survives exit; reopen the last one by passing `opencode --continue` through.
     with _session_config("opencode", launch, persist = persist) as cfg:
         config_path = cfg / "opencode.json"
+        skills_root = cfg / "skills"
+        write_skills(skills_root, skills, should_copy = should_copy_skills)
         # OPENCODE_CONFIG is an overlay, loaded between the user's global and project configs, so this adds the agent-switch provider/model for the session without changing the user's default model. The key lives in the config, not the env.
         session_permission = write_opencode_config(
             base,
@@ -879,6 +897,7 @@ def opencode(
             mcp_servers = mcp_servers,
             served_models = served_models,
             v2 = opencode_v2,
+            skills_root = _agent_config_path(skills_root, [command_name]) if skills else None,
         )
         # A project's own opencode.json outranks OPENCODE_CONFIG, so the session model pin would silently lose to a repo config; carry it in OPENCODE_CONFIG_CONTENT, which outranks project config, while the API key stays in the private file. Only the config fallback carries a permission: native --auto omits it (auto-approve asks, keep explicit denies) and a non-yolo session omits it too, honoring project rules. V1 filters are ordinary overlays, so scope that session to our provider; V2 turns filters into security policies where global/project rules intentionally win, so keep those policies intact and tell the user above that they must allow our provider. small_model is opencode's separate model for lightweight tasks; pin it to the session model too, or a user/project small_model on another (now filtered) provider would resolve a not-found error mid-session.
         inline_config: dict = {

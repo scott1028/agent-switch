@@ -8,10 +8,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 import agent_switch.start as start
@@ -800,3 +803,402 @@ def test_native_dsh_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
     result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", *flag])
     assert result.exit_code == 1
     assert "needs --url or --provider" in result.output
+
+
+def _get_dsh_skill_snapshot(root):
+    return {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
+            for path in root.rglob("*")}
+
+
+@pytest.fixture
+def dsh_skill_sources(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    dsh_home = user_home / "custom-dsh"
+    (dsh_home / "profiles" / "web").mkdir(parents = True)
+    (dsh_home / "profiles" / "web" / "cordis.patch.yml").write_text(
+        "- id: skill-filesystem\n  config:\n    watch: false\n"
+    )
+    (dsh_home / ".credentials.yaml").write_text("user-key: fake\n")
+    for root in [dsh_home / "skills", user_home / ".agents" / "skills"]:
+        for name in ["shared", "user-only"]:
+            (root / name).mkdir(parents = True)
+            (root / name / "SKILL.md").write_text(f"---\nname: {name}\n---\nUSER\n")
+    source = tmp_path / "skill sources" / "shared"
+    (source / "scripts").mkdir(parents = True)
+    (source / "SKILL.md").write_text("---\nname: shared\n---\nINJECTED\n")
+    (source / "scripts" / "run.py").write_text("print('injected')\n")
+    monkeypatch.setenv("DSH_HOME", str(dsh_home))
+    before_home = _get_dsh_skill_snapshot(user_home)
+    before_source = _get_dsh_skill_snapshot(source)
+    yield dsh_home, source
+    assert _get_dsh_skill_snapshot(user_home) == before_home
+    assert _get_dsh_skill_snapshot(source) == before_source
+
+
+@pytest.mark.parametrize("has_mcp", [False, True])
+@pytest.mark.parametrize("profile", ["web", "headless"])
+def test_native_dsh_skill_patch_is_additive_and_clears(fake_vllm, tmp_path, monkeypatch, dsh_skill_sources, has_mcp, profile):
+    yaml = pytest.importorskip("yaml")
+    _, source = dsh_skill_sources
+    _native_no_connect_dsh(monkeypatch)
+    args = ["dsh", "--no-launch"]
+    forwarded = ["--", "--profile", "headless", "hello"] if profile == "headless" else []
+    baseline = CliRunner().invoke(start.start_app, [*args, *forwarded])
+    assert baseline.exit_code == 0, baseline.output
+    session = tmp_path / "agents" / "dsh-native"
+    root = session / "skills-injected"
+    patch = session / dsh_agent._DSH_PATCH_FILE
+    assert not patch.exists()
+    mcp_flags = ["--mcp-stdio", "ev:npx everything"] if has_mcp else []
+    result = CliRunner().invoke(start.start_app, [
+        *args, *mcp_flags, "--skill", str(source), "--skill", f"renamed:{source}", *forwarded,
+    ])
+    assert result.exit_code == 0, result.output
+    rows = yaml.safe_load(patch.read_text())
+    assert {"id": "skill-filesystem", "config": {"customSkillDirs": [str(root)]}} in rows
+    assert len(rows) == 1 + has_mcp
+    assert bool(_dsh_mcp_rows(patch)) is has_mcp
+    command = _launch_command(baseline.output)
+    at = 2 if profile == "web" else 1
+    command[at:at] = ["--patch", str(patch)]
+    assert _launch_command(result.output) == command
+    assert "DSH_HOME" not in result.output
+    assert (root / "shared").is_symlink() and (root / "shared").resolve() == source
+    assert (root / "renamed" / "SKILL.md").read_text() == "---\nname: renamed\n---\nINJECTED\n"
+    assert (root / "renamed" / "scripts").resolve() == source / "scripts"
+    without_skills = CliRunner().invoke(start.start_app, [*args, *mcp_flags, *forwarded])
+    assert without_skills.exit_code == 0, without_skills.output
+    assert not (root / "shared").exists() and not (root / "renamed").exists()
+    if has_mcp:
+        assert len(yaml.safe_load(patch.read_text())) == 1 and _dsh_mcp_rows(patch)
+    else:
+        assert not patch.exists()
+    bare = CliRunner().invoke(start.start_app, [*args, *forwarded])
+    assert bare.exit_code == 0, bare.output
+    assert _launch_command(bare.output) == _launch_command(baseline.output)
+    assert not patch.exists()
+
+
+@pytest.mark.parametrize("should_persist", [False, True])
+@pytest.mark.parametrize("profile", ["web", "headless"])
+def test_routed_dsh_skill_patch_preserves_user_skills_and_clears(fake_vllm, tmp_path, dsh_skill_sources, should_persist, profile):
+    yaml = pytest.importorskip("yaml")
+    dsh_home, source = dsh_skill_sources
+    args = ["dsh", "--url", BASE, "--no-launch", *(["--persist"] if should_persist else []),
+            "--mcp-stdio", "ev:npx everything"]
+    forwarded = ["--", "--profile", "headless", "hello"] if profile == "headless" else []
+    baseline = CliRunner().invoke(start.start_app, [*args, *forwarded])
+    assert baseline.exit_code == 0, baseline.output
+    session = tmp_path / "agents" / "dsh"
+    patch = session / dsh_agent._DSH_PATCH_FILE
+    original_rows = yaml.safe_load(patch.read_text())
+    root = session / "skills-injected"
+    result = CliRunner().invoke(start.start_app, [
+        *args, "--skill", str(source), "--skill", f"renamed:{source}", *forwarded,
+    ])
+    assert result.exit_code == 0, result.output
+    rows = yaml.safe_load(patch.read_text())
+    assert rows == [*original_rows, {"id": "skill-filesystem", "config": {"customSkillDirs": [str(root)]}}]
+    assert _launch_command(result.output) == _launch_command(baseline.output)
+    assert (session / "skills").resolve() == dsh_home / "skills"
+    assert (session / "skills" / "user-only" / "SKILL.md").is_file()
+    assert (root / "shared").resolve() == source
+    assert (root / "renamed" / "SKILL.md").read_text() == "---\nname: renamed\n---\nINJECTED\n"
+    cleared = CliRunner().invoke(start.start_app, [*args, *forwarded])
+    assert cleared.exit_code == 0, cleared.output
+    assert yaml.safe_load(patch.read_text()) == original_rows
+    assert not (root / "shared").exists() and not (root / "renamed").exists()
+    assert (session / "skills").resolve() == dsh_home / "skills"
+    assert json.loads((root / ".agent-switch-skills.json").read_text()) == {"entries": []}
+
+
+def test_dsh_skill_persisted_launch_clears_row_and_entries(fake_vllm, tmp_path, monkeypatch, dsh_skill_sources):
+    _, source = dsh_skill_sources
+    set_start_attr(monkeypatch, "_resolve_or_install_agent", lambda command, *_: command)
+    args = ["dsh", "--url", BASE, "--persist"]
+    first = _capture_launch(monkeypatch, [*args, "--skill", str(source)])
+    session = tmp_path / "agents" / "dsh"
+    patch = session / dsh_agent._DSH_PATCH_FILE
+    root = session / "skills-injected"
+    assert (root / "shared").resolve() == source
+    assert _dsh_entries(patch)["skill-filesystem"]["config"] == {"customSkillDirs": [str(root)]}
+    second = _capture_launch(monkeypatch, args)
+    assert second["command"] == first["command"]
+    assert second["env"]["DSH_HOME"] == first["env"]["DSH_HOME"] == str(session)
+    assert "skill-filesystem" not in _dsh_entries(patch)
+    assert not (root / "shared").exists()
+
+
+def test_native_dsh_alias_carries_skill_patch(fake_vllm, tmp_path, monkeypatch, dsh_skill_sources):
+    _, source = dsh_skill_sources
+    _native_no_connect_dsh(monkeypatch)
+    set_start_attr(monkeypatch, "_check_alias", lambda *_: None)
+    result = CliRunner().invoke(start.start_app, ["dsh-x", "--no-launch", "--skill", str(source)])
+    assert result.exit_code == 0, result.output
+    patch = tmp_path / "agents" / "dsh-native" / dsh_agent._DSH_PATCH_FILE
+    assert _launch_command(result.output) == [
+        "bash", "-ic", 'dsh-x "$@"', "agent-switch", "web", "--patch", str(patch),
+    ]
+    assert _dsh_entries(patch)["skill-filesystem"]["config"] == {
+        "customSkillDirs": [str(patch.parent / "skills-injected")],
+    }
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_dsh_skill_windows_entries_are_copies_and_paths_are_translated(fake_vllm, tmp_path, monkeypatch, dsh_skill_sources, is_routed):
+    _, source = dsh_skill_sources
+    set_start_attr(monkeypatch, "_wsl_windows_executable", lambda _: "/mnt/c/npm/dsh.cmd")
+    calls = []
+    translated = r"C:\session\skills-injected"
+
+    def translate(path, command):
+        calls.append((path, command))
+        return translated if path.name == "skills-injected" else str(path)
+
+    monkeypatch.setattr(dsh_agent, "_agent_config_path", translate)
+    args = ["dsh", *(["--url", BASE] if is_routed else []), "--no-launch"]
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
+    assert result.exit_code == 0, result.output
+    session = tmp_path / "agents" / ("dsh" if is_routed else "dsh-native")
+    root = session / "skills-injected"
+    patch = session / dsh_agent._DSH_PATCH_FILE
+    assert _dsh_entries(patch)["skill-filesystem"]["config"] == {"customSkillDirs": [translated]}
+    assert calls == [(root, ["dsh"]), (patch, ["dsh"])]
+    for name in ["shared", "renamed"]:
+        entry = root / name
+        assert entry.is_dir() and not entry.is_symlink()
+        assert all(not child.is_symlink() for child in entry.rglob("*"))
+        assert (entry / "scripts" / "run.py").read_text() == "print('injected')\n"
+    note = "Note: dsh runs as a Windows program, so injected skills are copied; restart to pick up edits."
+    assert result.output.splitlines().count(note) == 1
+    cleared = CliRunner().invoke(start.start_app, args)
+    assert cleared.exit_code == 0, cleared.output
+    assert note not in cleared.output
+    assert not (root / "shared").exists() and not (root / "renamed").exists()
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_dsh_invalid_skill_fails_before_connect(fake_vllm, tmp_path, monkeypatch, is_routed):
+    _native_no_connect_dsh(monkeypatch)
+    source = tmp_path / "missing"
+    result = CliRunner().invoke(start.start_app, [
+        "dsh", *(["--url", BASE] if is_routed else []), "--no-launch", "--skill", str(source),
+    ])
+    assert result.exit_code == 1
+    assert str(source) in result.output and "holding SKILL.md" in result.output
+    assert fake_vllm == []
+
+
+def _write_dsh_tui_skill_profile(home):
+    package = home / "profiles/dsh-tui/node_modules/@deepseek-harness-tui/dsh-tui"
+    (package / "lib").mkdir(parents = True)
+    (package / "lib/preset-patch.js").write_text("export const apply = () => {};\n")
+    manifest = package / "package.json"
+    manifest.write_text(json.dumps({
+        "version": "0.17.0", "exports": {"./preset-patch": {"import": "./lib/preset-patch.js"}},
+    }))
+    return manifest
+
+
+@pytest.fixture
+def dsh_tui_skill_session(tmp_path, monkeypatch):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    native = user_home / "custom-dsh"
+    _write_dsh_tui_skill_profile(native)
+    monkeypatch.setenv("DSH_HOME", str(native))
+    monkeypatch.delenv("DSH_TUI_PRESET", raising = False)
+    source = tmp_path / "injected"
+    (source / "scripts").mkdir(parents = True)
+    (source / "SKILL.md").write_text("---\nname: shared\n---\nINJECTED\n")
+    (source / "scripts/run.py").write_text("print('injected')\n")
+    before = _get_dsh_skill_snapshot(source)
+    with tempfile.TemporaryDirectory(prefix = "as-tui-", dir = tmp_path.parent) as directory:
+        root = Path(directory) / "agents"
+        set_start_attr(monkeypatch, "_agents_config_root", lambda: root)
+        _write_dsh_tui_skill_profile(root / "dsh-tui/.dsh")
+        yield native, source, root
+    assert _get_dsh_skill_snapshot(source) == before
+
+
+@pytest.mark.parametrize("agent", ["dsh-tui", "dst"])
+@pytest.mark.parametrize("is_routed", [False, True])
+@pytest.mark.parametrize("has_mcp", [False, True])
+def test_dsh_tui_skills_patch_is_additive_and_clears(fake_vllm, dsh_tui_skill_session, agent, is_routed, has_mcp):
+    native, source, config_root = dsh_tui_skill_session
+    before = _get_dsh_skill_snapshot(native.parent)
+    args = [agent, *(["--url", BASE] if is_routed else []), "--no-launch",
+            *(["--mcp-stdio", "ev:npx everything"] if has_mcp else [])]
+    baseline = CliRunner().invoke(start.start_app, args)
+    assert baseline.exit_code == 0, baseline.output
+    session = config_root / ("dsh-tui" if is_routed else "dsh-tui-native")
+    patch = session / dsh_agent._DSH_PATCH_FILE
+    root = session / "skills-injected"
+    original = yaml.load(patch.read_text(), Loader = yaml.BaseLoader) if patch.exists() else []
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
+    assert result.exit_code == 0, result.output
+    rows = yaml.load(patch.read_text(), Loader = yaml.BaseLoader)
+    skill_rows = [row for row in rows if any(child.get("id", "").startswith("agent-switch-skills-") for child in row.get("insert", []))]
+    assert skill_rows == [{"insert": [{
+        "id": f"agent-switch-skills-{preset}",
+        "name": "@deepseek-harness-tui/dsh-tui/preset-patch",
+        "config": {"preset": preset, "config": {"skill-filesystem": {"customSkillDirs": [str(root)]}}},
+    }]} for preset in ["standard", "ptc", "liangshen"]]
+    assert [row for row in rows if row not in skill_rows] == original
+    assert all(row.get("id") != "skill-filesystem" for row in rows)
+    assert (root / "shared").resolve() == source
+    assert (root / "renamed/SKILL.md").read_text() == "---\nname: renamed\n---\nINJECTED\n"
+    hint = "Injected skills reach dsh-tui's standard, ptc and liangshen presets."
+    assert result.output.splitlines().count(hint) == 1
+    assert "DSH_HOME" not in result.output or is_routed
+    cleared = CliRunner().invoke(start.start_app, args)
+    assert cleared.exit_code == 0, cleared.output
+    assert (yaml.load(patch.read_text(), Loader = yaml.BaseLoader) if patch.exists() else []) == original
+    assert not (root / "shared").exists() and not (root / "renamed").exists()
+    assert hint not in cleared.output
+    assert _get_dsh_skill_snapshot(native.parent) == before
+
+
+@pytest.mark.parametrize("agent", ["dsh-tui", "dst"])
+@pytest.mark.parametrize("is_routed", [False, True])
+@pytest.mark.parametrize("failure", ["missing", "no-export", "missing-target"])
+def test_dsh_tui_skills_gate_requires_profile_export_and_target(fake_vllm, dsh_tui_skill_session, agent, is_routed, failure):
+    native, source, root = dsh_tui_skill_session
+    home = root / "dsh-tui/.dsh" if is_routed else native
+    profile = home / "profiles/dsh-tui"
+    package = profile / "node_modules/@deepseek-harness-tui/dsh-tui"
+    manifest = package / "package.json"
+    if failure == "missing":
+        manifest.unlink()
+    elif failure == "no-export":
+        manifest.write_text('{"version":"0.14.0","exports":{}}')
+    else:
+        (package / "lib/preset-patch.js").unlink()
+    before = _get_dsh_skill_snapshot(native.parent)
+    args = [agent, *(["--url", BASE] if is_routed else []), "--no-launch"]
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source)])
+    assert result.exit_code == 1
+    assert str(profile) in result.output
+    if failure == "missing":
+        assert "start dsh-tui once without --skill" in result.output
+    else:
+        assert "--skill needs dsh-tui 0.17 or newer" in result.output
+        assert f"found {'0.14.0' if failure == 'no-export' else '0.17.0'}" in result.output
+        if is_routed:
+            assert "DSH_HOME=" in result.output and "dsh-tui update`." in result.output
+        else:
+            assert "; run `dsh-tui update`." in result.output
+    session = root / ("dsh-tui" if is_routed else "dsh-tui-native")
+    assert not (session / "skills-injected").exists()
+    assert not (session / dsh_agent._DSH_PATCH_FILE).exists()
+    assert "Injected skills reach" not in result.output
+    bare = CliRunner().invoke(start.start_app, args)
+    assert bare.exit_code == 0, bare.output
+    assert _get_dsh_skill_snapshot(native.parent) == before
+
+
+@pytest.mark.parametrize(("is_routed", "environment", "saved", "warned"), [
+    (False, "cordis", None, "cordis"), (False, None, "minimal", "minimal"),
+    (False, "ptc", "minimal", None), (False, "  ", "custom", "custom"),
+    (True, "cordis", None, None), (True, "cordis", "minimal", "minimal"),
+    (True, None, "liangshen", None), (True, None, "custom", "custom"),
+])
+def test_dsh_tui_skills_warn_about_effective_known_preset(fake_vllm, monkeypatch, dsh_tui_skill_session, is_routed, environment, saved, warned):
+    native, source, root = dsh_tui_skill_session
+    if environment is not None:
+        monkeypatch.setenv("DSH_TUI_PRESET", environment)
+    if saved is not None:
+        home = root / "dsh-tui" if is_routed else native.parent
+        (home / ".dsh-tui").mkdir(parents = True, exist_ok = True)
+        (home / ".dsh-tui/agent-preset.json").write_text(json.dumps({"preset": saved}))
+    before = _get_dsh_skill_snapshot(native.parent)
+    result = CliRunner().invoke(start.start_app, [
+        "dsh-tui", *(["--url", BASE] if is_routed else []), "--no-launch", "--skill", str(source),
+    ])
+    assert result.exit_code == 0, result.output
+    warnings = [line for line in result.output.splitlines() if "injected skills do not reach" in line]
+    assert warnings == ([] if warned is None else [
+        f"Warning: injected skills do not reach dsh-tui preset {warned!r}; use standard, ptc or liangshen.",
+    ])
+    assert result.output.splitlines().count("Injected skills reach dsh-tui's standard, ptc and liangshen presets.") == 1
+    assert _get_dsh_skill_snapshot(native.parent) == before
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_dsh_tui_alias_refuses_skills_before_alias_probe(fake_vllm, monkeypatch, dsh_tui_skill_session, is_routed):
+    _, source, _ = dsh_tui_skill_session
+    set_start_attr(monkeypatch, "_check_alias", lambda *_: pytest.fail("alias must be refused first"))
+    result = CliRunner().invoke(start.start_app, [
+        "dsh-tui-personal", *(["--url", BASE] if is_routed else []), "--no-launch", "--skill", str(source),
+    ])
+    assert result.exit_code == 1
+    assert "--skill is not supported for dsh-tui aliases" in result.output
+    assert "own DSH_HOME and HOME" in result.output
+    assert fake_vllm == []
+
+
+@pytest.mark.parametrize("export", ["./lib/preset-patch.js", {"import": "./lib/preset-patch.js"}, {"default": "./lib/preset-patch.js"}])
+def test_native_dsh_tui_skills_accept_runtime_export_shapes(fake_vllm, dsh_tui_skill_session, export):
+    native, source, _ = dsh_tui_skill_session
+    manifest = native / "profiles/dsh-tui/node_modules/@deepseek-harness-tui/dsh-tui/package.json"
+    manifest.write_text(json.dumps({"version": "0.17.0", "exports": {"./preset-patch": export}}))
+    result = CliRunner().invoke(start.start_app, ["dsh-tui", "--no-launch", "--skill", str(source)])
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_native_dsh_tui_skills_gate_resolves_default_and_tilde_home(fake_vllm, monkeypatch, dsh_tui_skill_session, configured):
+    native, source, _ = dsh_tui_skill_session
+    (native / "profiles/dsh-tui/node_modules/@deepseek-harness-tui/dsh-tui/package.json").unlink()
+    if configured:
+        monkeypatch.setenv("DSH_HOME", "~/tilde-dsh")
+    else:
+        monkeypatch.delenv("DSH_HOME")
+    _write_dsh_tui_skill_profile(native.parent / ("tilde-dsh" if configured else ".dsh"))
+    result = CliRunner().invoke(start.start_app, ["dsh-tui", "--no-launch", "--skill", str(source)])
+    assert result.exit_code == 0, result.output
+
+
+def test_native_dsh_tui_windows_skill_entries_are_copies(fake_vllm, monkeypatch, dsh_tui_skill_session):
+    _, source, root = dsh_tui_skill_session
+    set_start_attr(monkeypatch, "_wsl_windows_executable",
+        lambda command: "/mnt/c/npm/dsh-tui.cmd" if command[0] == "dsh-tui" else None,
+    )
+    set_start_attr(monkeypatch, "_wsl_windows_path", str)
+    result = CliRunner().invoke(start.start_app, [
+        "dsh-tui", "--no-launch", "--skill", str(source), "--skill", f"renamed:{source}",
+    ])
+    assert result.exit_code == 0, result.output
+    for name in ["shared", "renamed"]:
+        entry = root / "dsh-tui-native/skills-injected" / name
+        assert entry.is_dir() and not entry.is_symlink()
+        assert all(not path.is_symlink() for path in entry.rglob("*"))
+    assert "Note: dsh-tui runs as a Windows program" in result.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "executes the POSIX update recipe")
+def test_routed_dsh_tui_skills_update_command_preserves_session_env(fake_vllm, tmp_path, monkeypatch, dsh_tui_skill_session):
+    _, source, root = dsh_tui_skill_session
+    config_root = root / "session ' home"
+    home = config_root / "dsh-tui"
+    manifest = _write_dsh_tui_skill_profile(home / ".dsh")
+    manifest.write_text('{"version":"0.14.0","exports":{}}')
+    set_start_attr(monkeypatch, "_agents_config_root", lambda: config_root)
+    monkeypatch.setenv("PNPM_HOME", "/inherited/pnpm")
+    result = CliRunner().invoke(start.start_app, [
+        "dsh-tui", "--url", BASE, "--no-launch", "--skill", str(source),
+    ])
+    assert result.exit_code == 1
+    assert "; run `" in result.output
+    command = result.output.split("; run `", 1)[1].split("`", 1)[0]
+    executable = tmp_path / "bin" / "dsh-tui"
+    executable.parent.mkdir()
+    executable.write_text(f"#!{sys.executable}\nimport json, os, sys\nassert sys.argv[1:] == ['update']\nprint(json.dumps(dict(os.environ)))\n")
+    executable.chmod(0o755)
+    captured = subprocess.run(
+        ["/bin/sh", "-c", command], env = {**os.environ, "PATH": str(executable.parent)},
+        capture_output = True, text = True,
+    )
+    assert captured.returncode == 0, captured.stderr
+    actual = json.loads(captured.stdout)
+    expected = {**dsh_agent._get_dsh_tui_env(home), "DSH_HOME": str(home / ".dsh")}
+    assert {name: actual[name] for name in expected} == expected

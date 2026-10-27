@@ -29,11 +29,49 @@ from tests.cli_support import (
     _SESSION_FLAGS,
     _assert_env_set,
     _assert_env_unset,
+    _assert_windows_agent_copies_injected_skills,
     _launch_command,
     _mcp_registry,
     _simulate_windows,
 )
 from tests.start_split import set_start_attr
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_windows_pi_copies_injected_skills(fake_vllm, tmp_path, monkeypatch, is_routed):
+    _assert_windows_agent_copies_injected_skills(
+        fake_vllm, tmp_path, monkeypatch, "pi", "pi", is_routed
+    )
+
+
+def _get_skill_snapshot(root):
+    return {str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
+            for path in root.rglob("*")}
+
+
+@pytest.fixture
+def pi_skill_sources(tmp_path, monkeypatch):
+    agent_dir = _pi_user_agent_dir(tmp_path, monkeypatch)
+    for folder, name in [("injected", "other-name"), ("other-folder", "injected"), ("user-only", "user-only")]:
+        child = agent_dir / "skills" / folder
+        child.mkdir(parents = True)
+        (child / "SKILL.md").write_text(f"---\nname: {name}\n---\nUSER\n")
+    (agent_dir / "extensions").mkdir()
+    (agent_dir / "extensions" / "mine.ts").write_text("export default () => {};\n")
+    (agent_dir / "auth.json").write_text('{"user-provider": "user-key"}\n')
+    (agent_dir / "models.json").write_text('{"providers": {"user-provider": {}}}\n')
+    (agent_dir / "settings.json").write_text(json.dumps({
+        "defaultProvider": "user-provider", "defaultModel": "user-model",
+        "skills": ["skills/*", "skills/user-only"], "extensions": ["extensions/mine.ts"],
+    }))
+    source = tmp_path / "injected"
+    source.mkdir()
+    (source / "SKILL.md").write_text("---\nname: injected\n---\nINJECTED\n")
+    before_agent = _get_skill_snapshot(agent_dir)
+    before_source = _get_skill_snapshot(source)
+    yield agent_dir, source
+    assert _get_skill_snapshot(agent_dir) == before_agent
+    assert _get_skill_snapshot(source) == before_source
 
 
 def test_missing_pi_subagent_extension_fails_before_install_or_connect(monkeypatch, tmp_path):
@@ -980,3 +1018,114 @@ def test_native_pi_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
     result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", *flag])
     assert result.exit_code == 1
     assert "needs --url or --provider" in result.output
+
+
+@pytest.mark.parametrize("source_option", ["default", "relative", "tilde", "absolute"])
+def test_native_pi_skill_overlay_preserves_config_and_filters_names(fake_vllm, tmp_path, monkeypatch, pi_skill_sources, source_option):
+    user_agent, source = pi_skill_sources
+    before_user_agent = _get_skill_snapshot(user_agent)
+    _native_no_connect_pi(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    if source_option != "default":
+        configured = {"relative": os.path.relpath(user_agent, tmp_path), "tilde": "~/.pi/agent", "absolute": str(user_agent)}[source_option]
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", f"  {configured}  ")
+    baseline = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    assert baseline.exit_code == 0, baseline.output
+    assert _launch_command(baseline.output) == ["pi"]
+    assert "PI_CODING_AGENT_DIR" not in baseline.output
+    overlay = tmp_path / "agents" / "pi-native" / "agent"
+    assert not os.path.lexists(overlay)
+    result = CliRunner().invoke(start.start_app, [
+        "pi", "--no-launch", "--skill", str(source), "--skill", f"renamed:{source}",
+    ])
+    assert result.exit_code == 0, result.output
+    _assert_env_set(result.output, "PI_CODING_AGENT_DIR", str(overlay))
+    assert "export HOME=" not in result.output and "USERPROFILE" not in result.output
+    assert _launch_command(result.output) == ["pi"]
+    for name in ["auth.json", "models.json", "settings.json", "extensions"]:
+        assert (overlay / name).is_symlink()
+        assert (overlay / name).resolve() == user_agent / name
+    assert not (overlay / "skills").is_symlink()
+    assert (overlay / "skills" / "user-only").resolve() == user_agent / "skills" / "user-only"
+    assert not (overlay / "skills" / "other-folder").exists()
+    assert (overlay / "skills" / "injected").resolve() == source
+    assert not (overlay / "skills" / "renamed").is_symlink()
+    assert "name: renamed\n" in (overlay / "skills" / "renamed" / "SKILL.md").read_text()
+    cleared = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    assert cleared.exit_code == 0, cleared.output
+    assert _launch_command(cleared.output) == ["pi"]
+    assert not overlay.exists()
+    assert _get_skill_snapshot(user_agent) == before_user_agent
+
+
+@pytest.mark.parametrize("should_persist", [False, True])
+def test_routed_pi_skill_overlay_preserves_settings_and_restores_whole_link(fake_vllm, tmp_path, pi_skill_sources, should_persist):
+    user_agent, source = pi_skill_sources
+    args = ["pi", "--url", BASE, "--no-launch", *(["--persist"] if should_persist else [])]
+    agent_dir = tmp_path / "agents" / "pi" / ".pi" / "agent"
+    baseline = CliRunner().invoke(start.start_app, args)
+    assert baseline.exit_code == 0, baseline.output
+    assert (agent_dir / "skills").is_symlink()
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
+    assert result.exit_code == 0, result.output
+    assert not (agent_dir / "skills").is_symlink()
+    assert (agent_dir / "skills" / "injected").resolve() == source
+    assert not (agent_dir / "skills" / "other-folder").exists()
+    assert "name: renamed\n" in (agent_dir / "skills" / "renamed" / "SKILL.md").read_text()
+    settings = json.loads((agent_dir / "settings.json").read_text())
+    assert settings["skills"] == ["skills/*", "skills/user-only"]
+    assert settings["extensions"] == ["extensions/mine.ts"]
+    restored = CliRunner().invoke(start.start_app, args)
+    assert restored.exit_code == 0, restored.output
+    assert (agent_dir / "skills").is_symlink()
+    assert (agent_dir / "skills").resolve() == user_agent / "skills"
+    assert not (agent_dir / "skills" / "renamed").exists()
+    assert (agent_dir / "skills" / "other-folder").resolve() == user_agent / "skills" / "other-folder"
+    assert _launch_command(restored.output) == _launch_command(baseline.output)
+
+
+@pytest.mark.parametrize(("agent", "flags", "message"), [
+    ("pi-personal", [], "PI_CODING_AGENT_DIR"),
+    ("pi", ["--url", BASE, "--as-subagent"], "--skill cannot be combined with --as-subagent."),
+])
+def test_pi_skill_refuses_alias_and_subagent(fake_vllm, monkeypatch, pi_skill_sources, agent, flags, message):
+    _, source = pi_skill_sources
+    _native_no_connect_pi(monkeypatch)
+    set_start_attr(monkeypatch, "_check_alias", lambda *args: pytest.fail("alias must be rejected"))
+    result = CliRunner().invoke(start.start_app, [agent, *flags, "--no-launch", "--skill", str(source)])
+    assert result.exit_code == 1
+    assert message in result.output
+
+
+def test_pi_skill_windows_resource_skip_clears_owned_entries(tmp_path, monkeypatch, pi_skill_sources):
+    _, source = pi_skill_sources
+    set_start_attr(monkeypatch, "_wsl_windows_executable", lambda _: "/mnt/c/npm/pi.cmd")
+    home = tmp_path / "session"
+    agent_dir = home / ".pi" / "agent"
+    pi_agent.write_pi_user_resources(agent_dir, home, skills = {"injected": source})
+    entry = agent_dir / "skills" / "injected"
+    assert entry.is_dir() and not entry.is_symlink()
+    assert (entry / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+    pi_agent.write_pi_user_resources(agent_dir, home)
+    assert not (agent_dir / "skills").exists()
+
+
+def test_persisted_pi_skill_injection_preserves_unowned_session_skills(fake_vllm, tmp_path, monkeypatch):
+    user_agent = _pi_user_agent_dir(tmp_path, monkeypatch)
+    before = _get_skill_snapshot(user_agent)
+    args = ["pi", "--url", BASE, "--persist", "--no-launch"]
+    baseline = CliRunner().invoke(start.start_app, args)
+    assert baseline.exit_code == 0, baseline.output
+    root = tmp_path / "agents" / "pi" / ".pi" / "agent" / "skills"
+    installed = root / "session-installed" / "SKILL.md"
+    installed.parent.mkdir(parents = True)
+    installed.write_text("Installed in this session.\n")
+    source = tmp_path / "injected"
+    source.mkdir()
+    (source / "SKILL.md").write_text("Injected skill.\n")
+    result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source)])
+    assert result.exit_code == 1
+    assert str(root) in result.output
+    assert installed.read_text() == "Installed in this session.\n"
+    assert not (root / "injected").exists()
+    assert _get_skill_snapshot(user_agent) == before

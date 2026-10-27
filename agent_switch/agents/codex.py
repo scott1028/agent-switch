@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +32,7 @@ from agent_switch.core.launch import (
     _run_native,
 )
 from agent_switch.core.mcp import load_mcp_servers
+from agent_switch.core.overlay import write_native_overlay
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -60,6 +60,7 @@ from agent_switch.core.options import (
     _REASONING_FIELDS,
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
+    _SKILL_OPTION,
     _SUBAGENT_DESCRIPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
@@ -73,12 +74,12 @@ from agent_switch.core.options import (
     _yolo_command_flags,
 )
 from agent_switch.core.platform import (
-    _create_directory_junction,
     _looks_like_path,
     _remove_overlay_entry,
     _wsl_windows_executable,
 )
-from agent_switch.core.session import _session_config
+from agent_switch.core.session import _agent_config_path, _session_config
+from agent_switch.core.skills import load_skills, write_skills
 from agent_switch.core.storage import _write_private_json, _write_private_text
 from agent_switch.providers.utils import get_has_custom_authorization
 
@@ -500,10 +501,14 @@ def _codex_source_home(*, ignore_configured: bool = False) -> Path:
     return Path.home() / ".codex"
 
 
-def write_codex_parent_overlay(overlay: Path) -> Path:
-    """Add local-agent routing without replacing the cloud parent's configuration."""
-    overlay.mkdir(parents = True, exist_ok = True, mode = 0o700)
-
+def write_codex_parent_overlay(
+    overlay: Path,
+    *,
+    routing: Optional[str] = _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS,
+    skills: Optional[dict] = None,
+    should_copy_skills: bool = False,
+) -> Path:
+    """Preserve the user's Codex home while adding session routing or injected skills."""
     manifest_path = overlay / _CODEX_PARENT_OVERLAY_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding = "utf-8"))
@@ -522,52 +527,16 @@ def write_codex_parent_overlay(overlay: Path) -> Path:
                 source_home = _codex_source_home(ignore_configured = True)
         else:
             source_home = _codex_source_home(ignore_configured = True)
-        source_key = str(source_home.resolve(strict = False))
-    same_source = isinstance(manifest, dict) and manifest.get("source_home") == source_key
-    if same_source:
-        managed_entries = manifest.get("entries", [])
-        if not isinstance(managed_entries, list):
-            managed_entries = []
-        for name in managed_entries:
-            if isinstance(name, str) and name not in {"", ".", ".."} and Path(name).name == name:
-                _remove_overlay_entry(overlay / name)
-    else:
-        # A reused overlay must never mix credentials, config, or plugins from two different Codex homes. Legacy overlays have no manifest, so rebuild them once.
-        for target in list(overlay.iterdir()):
-            _remove_overlay_entry(target)
-
-    # Keep the user's auth, config, plugins, agents, skills, rules and session state visible. Symlinks make this an overlay rather than a stale copy; if Windows denies them, directory junctions keep large runtime state shared without a bulk copy, and the configuration surfaces and sessions are copied only when both link forms are unavailable.
-    fallback_dirs = {"agents", "skills", "rules", "plugins", "marketplaces", "sessions"}
-    entries = []
-    if source_home.is_dir():
-        for source in source_home.iterdir():
-            if source.name in {
-                "AGENTS.md",
-                "AGENTS.override.md",
-                _CODEX_PARENT_OVERLAY_MANIFEST,
-            }:
-                continue
-            target = overlay / source.name
-            _remove_overlay_entry(target)
-            try:
-                target.symlink_to(source, target_is_directory = source.is_dir())
-                entries.append(source.name)
-            except OSError:
-                if source.is_file():
-                    shutil.copy2(source, target)
-                    entries.append(source.name)
-                elif source.is_dir():
-                    if _create_directory_junction(source, target):
-                        entries.append(source.name)
-                    elif source.name in fallback_dirs:
-                        shutil.copytree(source, target)
-                        entries.append(source.name)
-
-    _write_private_json(
-        manifest_path,
-        {"source_home": source_key, "entries": sorted(entries)},
+    write_native_overlay(
+        overlay, source_home, manifest_name = _CODEX_PARENT_OVERLAY_MANIFEST,
+        excluded = ("AGENTS.md", "AGENTS.override.md") if routing is not None else (),
+        copy_directories = {"agents", "skills", "rules", "plugins", "marketplaces", "sessions"},
+        skills = skills,
+        should_copy_skills = should_copy_skills,
     )
 
+    if routing is None:
+        return overlay
     inherited = ""
     instruction_name = "AGENTS.md"
     for candidate in (source_home / "AGENTS.override.md", source_home / "AGENTS.md"):
@@ -586,10 +555,20 @@ def write_codex_parent_overlay(overlay: Path) -> Path:
     other = overlay / other_name
     if other.is_file() or other.is_symlink():
         other.unlink()
-    routing = _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS
     combined = f"{inherited}\n\n{routing}\n" if inherited else f"{routing}\n"
     _write_private_text(overlay / instruction_name, combined)
     return overlay
+
+
+def _get_codex_skill_flags(root: Path, skills: Optional[dict]) -> list:
+    rules = []
+    for name in skills or {}:
+        path = _agent_config_path(root / name / "SKILL.md", ["codex"])
+        rules += [
+            f"{{ name = {json.dumps(name)}, enabled = false }}",
+            f"{{ path = {json.dumps(path)}, enabled = true }}",
+        ]
+    return ["-c", f"skills.config=[{', '.join(rules)}]"] if rules else []
 
 
 def _codex_subagent_flags(path: Path) -> list[str]:
@@ -651,6 +630,7 @@ def codex(
     mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
+    skill: Optional[list[str]] = _SKILL_OPTION,
 ):
     """Point OpenAI Codex at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -664,6 +644,7 @@ def codex(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
+    skills = load_skills(skill, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(
@@ -687,6 +668,11 @@ def codex(
     alias = ctx.meta.get(_ALIAS_META)
     if alias and as_subagent:
         _fail("--as-subagent is not supported for agent aliases.")
+    if alias and skills:
+        _fail(
+            "--skill is not supported for codex aliases: the alias sets its own CODEX_HOME; "
+            "use `agent-switch codex`."
+        )
     if alias and target is not None:
         # The function sets its own CODEX_HOME, which outranks the session env, so the session
         # config with the local provider and key would be silently ignored.
@@ -700,17 +686,33 @@ def codex(
         _check_alias(alias)
     else:
         executable = _require_agent_for_launch("codex", install_hint, launch)
+    should_copy_skills = bool(skills and _wsl_windows_executable(["codex"]))
+    if should_copy_skills:
+        typer.echo(
+            "Note: codex runs as a Windows program, so injected skills are copied; "
+            "restart to pick up edits."
+        )
     if target is None:
-        # Native launch: codex keeps its own model, login and ~/.codex config (no --oss, no
-        # --profile, CODEX_HOME untouched); each mounted server rides its own -c flag.
+        # Without injected skills, native launch leaves CODEX_HOME untouched.
         with _session_config("codex-native", launch) as config:
             env = {}
             mcp_flags = _codex_native_mcp_flags(config, mcp_servers or {}, env)
+            skill_flags = []
+            if skills:
+                home = write_codex_parent_overlay(
+                    config / "home", routing = None, skills = skills,
+                    should_copy_skills = should_copy_skills,
+                )
+                env["CODEX_HOME"] = str(home)
+                skill_flags = _get_codex_skill_flags(home / "skills", skills)
+            else:
+                _remove_overlay_entry(config / "home")
             command = _agent_command(
                 alias,
                 "codex",
                 [
                     *mcp_flags,
+                    *skill_flags,
                     *_yolo_command_flags("codex", yolo),
                     *_drop_overridden_args("codex", ctx.args, _yolo_command_flags("codex", yolo)),
                 ],
@@ -785,22 +787,24 @@ def codex(
             )
         return
     served_models = _get_served_models(target, key, max_seq_length)
-    command = [
-        "codex",
-        "--oss",
-        "--profile",
-        _CODEX_PROFILE,
-        *_yolo_command_flags("codex", yolo),
-        *_drop_overridden_args(
-            "codex",
-            ctx.args,
-            ["--oss", "--profile", _CODEX_PROFILE, *_yolo_command_flags("codex", yolo)],
-        ),
-    ]
     with _session_config("codex", launch, persist = persist) as home:
         write_codex_config(
             base, entry, home, codex_effort, headers, compact_at, mcp_servers, served_models
         )
+        write_skills(home / "skills", skills, should_copy = should_copy_skills)
+        command = [
+            "codex",
+            "--oss",
+            "--profile",
+            _CODEX_PROFILE,
+            *_get_codex_skill_flags(home / "skills", skills),
+            *_yolo_command_flags("codex", yolo),
+            *_drop_overridden_args(
+                "codex",
+                ctx.args,
+                ["--oss", "--profile", _CODEX_PROFILE, *_yolo_command_flags("codex", yolo)],
+            ),
+        ]
         env = {_CODEX_ENV_KEY: key, "CODEX_HOME": str(home)}
         _run(
             base,

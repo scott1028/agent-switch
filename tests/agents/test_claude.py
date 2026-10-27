@@ -30,6 +30,7 @@ from tests.cli_support import (
     MODEL,
     _assert_env_set,
     _assert_env_unset,
+    _assert_windows_agent_copies_injected_skills,
     _capture_launch,
     _launch_command,
     _mcp_registry,
@@ -37,6 +38,43 @@ from tests.cli_support import (
     _simulate_windows,
 )
 from tests.start_split import set_start_attr
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_windows_claude_copies_injected_skills(fake_vllm, tmp_path, monkeypatch, is_routed):
+    _assert_windows_agent_copies_injected_skills(
+        fake_vllm, tmp_path, monkeypatch, "claude", "claude", is_routed
+    )
+
+
+def _get_skill_snapshot(root):
+    return {
+        str(path.relative_to(root)): (path.read_bytes() if path.is_file() else None)
+        for path in root.rglob("*")
+    }
+
+
+@pytest.fixture
+def claude_skill_sources(tmp_path, monkeypatch):
+    home = tmp_path / "user-home"
+    user_config = home / ".claude"
+    user_skill = user_config / "skills" / "shared"
+    user_skill.mkdir(parents = True)
+    (user_skill / "SKILL.md").write_text("---\nname: shared\ndescription: USER\n---\n")
+    (user_config / "settings.json").write_text('{"model": "cloud-model"}\n')
+    (user_config / "CLAUDE.md").write_text("User instructions.\n")
+    source = tmp_path / "skill sources" / "shared"
+    source.mkdir(parents = True)
+    (source / "SKILL.md").write_text("---\nname: shared\ndescription: INJECTED\n---\nBody.\n")
+    (source / "notes.txt").write_text("Keep these notes.\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(user_config))
+    before_home = _get_skill_snapshot(home)
+    before_source = _get_skill_snapshot(source)
+    yield home, source
+    assert _get_skill_snapshot(home) == before_home
+    assert _get_skill_snapshot(source) == before_source
 
 
 def _fake_claude(monkeypatch, version_output: str) -> None:
@@ -914,3 +952,136 @@ def test_native_claude_refuses_a_positional_model(fake_vllm, monkeypatch):
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch", "org/gemma-4-26B"])
     assert result.exit_code == 1
     assert "--model needs --url or --provider" in result.output
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_claude_skill_mounts_session_folder_with_mcp_and_hint(fake_vllm, tmp_path, claude_skill_sources, is_routed):
+    _, source = claude_skill_sources
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", *(["--url", BASE] if is_routed else []), "--no-launch",
+         "--mcp-stdio", "ev:npx everything", "--skill", str(source),
+         "--skill", f"renamed:{source}", "--", "--print", "hello"],
+    )
+    assert result.exit_code == 0, result.output
+    session = tmp_path / "agents" / ("claude" if is_routed else "claude-native")
+    added_dir = session / "agent-switch"
+    command = _launch_command(result.output)
+    assert command.count(f"--add-dir={added_dir}") == 1
+    assert "--add-dir" not in command
+    assert command[-2:] == ["--print", "hello"]
+    assert command.index(f"--add-dir={added_dir}") < command.index("--print")
+    assert any(arg.startswith("--mcp-config=") for arg in command)
+    assert ("--strict-mcp-config" in command) is is_routed
+    root = added_dir / ".claude" / "skills"
+    assert (root / "shared").is_symlink()
+    assert (root / "shared").resolve() == source
+    assert (root / "renamed").is_dir() and not (root / "renamed").is_symlink()
+    assert "name: renamed\n" in (root / "renamed" / "SKILL.md").read_text()
+    assert (root / "renamed" / "notes.txt").is_symlink()
+    assert [line for line in result.output.splitlines() if line.startswith("Injected skills:")] == [
+        "Injected skills: shared, renamed. If one shares a name with an existing skill, "
+        "Claude lists it as agent-switch:<name>."
+    ]
+    assert "CLAUDE_CONFIG_DIR" not in result.output
+
+
+@pytest.mark.parametrize(("is_routed", "should_persist"), [(False, False), (True, False), (True, True)])
+def test_claude_skill_rerun_clears_entries_and_restores_command_and_env(fake_vllm, tmp_path, claude_skill_sources, is_routed, should_persist):
+    _, source = claude_skill_sources
+    args = ["claude", *(["--url", BASE] if is_routed else []), "--no-launch",
+            *(["--persist"] if should_persist else [])]
+    session = tmp_path / "agents" / ("claude" if is_routed else "claude-native")
+    baseline = CliRunner().invoke(start.start_app, [*args, "--", "--print", "hello"])
+    assert baseline.exit_code == 0, baseline.output
+    assert not (session / "agent-switch").exists()
+    if not is_routed:
+        assert _launch_command(baseline.output) == ["claude", "--print", "hello"]
+    first = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
+    assert first.exit_code == 0, first.output
+    root = session / "agent-switch" / ".claude" / "skills"
+    assert (root / "shared").is_symlink() and (root / "renamed").is_dir()
+    (root / "user-owned.txt").write_text("Keep me.\n")
+    second = CliRunner().invoke(start.start_app, [*args, "--", "--print", "hello"])
+    assert second.exit_code == 0, second.output
+    assert _launch_command(second.output) == _launch_command(baseline.output)
+    assert [line for line in second.output.splitlines() if line.startswith(("export ", "unset ", "$env:", "Remove-Item"))] == [
+        line for line in baseline.output.splitlines() if line.startswith(("export ", "unset ", "$env:", "Remove-Item"))
+    ]
+    assert not any(arg.startswith("--add-dir") for arg in _launch_command(second.output))
+    assert "Injected skills:" not in second.output
+    assert not os.path.lexists(root / "shared") and not (root / "renamed").exists()
+    assert (root / "user-owned.txt").read_text() == "Keep me.\n"
+    assert json.loads((root / ".agent-switch-skills.json").read_text()) == {"entries": []}
+
+
+def test_native_claude_alias_carries_skill_flag(fake_vllm, tmp_path, monkeypatch, claude_skill_sources):
+    _, source = claude_skill_sources
+    _native_no_connect(monkeypatch)
+    set_start_attr(monkeypatch, "_check_alias", lambda alias: None)
+    result = CliRunner().invoke(
+        start.start_app, ["claude-personal", "--no-launch", "--skill", str(source), "--", "--print", "hello"]
+    )
+    assert result.exit_code == 0, result.output
+    added_dir = tmp_path / "agents" / "claude-native" / "agent-switch"
+    assert _launch_command(result.output) == [
+        "bash", "-ic", 'claude-personal "$@"', "agent-switch",
+        f"--add-dir={added_dir}", "--print", "hello",
+    ]
+    assert "Injected skills: shared." in result.output
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_claude_skill_refuses_subagent_before_connect(fake_vllm, monkeypatch, claude_skill_sources, is_routed):
+    _, source = claude_skill_sources
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", *(["--url", BASE] if is_routed else []), "--as-subagent", "--no-launch", "--skill", str(source)],
+    )
+    assert result.exit_code == 1
+    assert "--skill cannot be combined with --as-subagent." in result.output
+    assert "Injected skills:" not in result.output
+    assert fake_vllm == []
+
+
+def test_claude_skill_flag_uses_translated_directory(fake_vllm, tmp_path, monkeypatch, claude_skill_sources):
+    _, source = claude_skill_sources
+    calls = []
+    translated = r"C:\Users\test user\session\agent-switch"
+
+    def translate(path, command):
+        calls.append((path, command))
+        return translated
+
+    monkeypatch.setattr(claude_agent, "_agent_config_path", translate)
+    flags = claude_agent._get_claude_skill_flags(tmp_path / "session", {"shared": source})
+    assert flags == [f"--add-dir={translated}"]
+    assert calls == [(tmp_path / "session" / "agent-switch", ["claude"])]
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_claude_skill_hint_precedes_launch_and_matches_recipe(fake_vllm, tmp_path, monkeypatch, claude_skill_sources, is_routed):
+    _, source = claude_skill_sources
+    args = ["claude", *(["--url", BASE, "--persist"] if is_routed else []), "--skill", str(source)]
+    recipe = CliRunner().invoke(start.start_app, [*args, "--no-launch", "--", "--print", "hello"])
+    assert recipe.exit_code == 0, recipe.output
+    recipe_session = tmp_path / "agents" / ("claude" if is_routed else "claude-native")
+    captured = {}
+
+    def launch(command, env, **kwargs):
+        captured.update(command = command, env = env)
+        added_dir = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--add-dir=")))
+        assert (added_dir / ".claude" / "skills" / "shared" / "SKILL.md").is_file()
+        captured["session"] = str(added_dir.parent)
+        click.echo("LAUNCH_CAPTURED")
+        return 0
+
+    set_start_attr(monkeypatch, "_launch", launch)
+    launched = CliRunner().invoke(start.start_app, [*args, "--", "--print", "hello"])
+    assert launched.exit_code == 0, launched.output
+    assert launched.output.index("Injected skills:") < launched.output.index("LAUNCH_CAPTURED")
+    assert captured["command"] == [
+        arg.replace(str(recipe_session), captured["session"]) for arg in _launch_command(recipe.output)
+    ]
+    assert "CLAUDE_CONFIG_DIR" not in captured["env"] and "HOME" not in captured["env"]

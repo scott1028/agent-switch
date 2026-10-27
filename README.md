@@ -12,6 +12,7 @@ with one command. Your usual agent settings stay unchanged.**
 | **One command per agent** | Name the agent and your model server's address. The agent starts already connected, and agent-switch works out what kind of server it is. | `agent-switch opencode --url http://127.0.0.1:8080` |
 | **Several OpenAI-compatible servers at once** | Connect more than one model server in the same command. Give each a short name, and the agent shows all their models in one list. | `agent-switch opencode --url a:http://127.0.0.1:8080 --url b:http://127.0.0.1:11434` |
 | **One MCP setup for every agent** | Add tools (MCP servers) the same way for every agent. Save them once in `~/.agent-switch/mcp.json`, and agent-switch turns them into each agent's own format. | `agent-switch claude --mcp context7` and `agent-switch codex --mcp context7` |
+| **Session skills** | Add skill folders for one agent session, without changing its saved skill list. | `agent-switch claude --skill /tmp/skills/my-test-skill` |
 | **Keys for several providers, no agent login** | Give each server its own key. agent-switch remembers it, never sends it to another server, and hands it to the agent, so you skip the agent's own login. | `agent-switch opencode --url a:http://127.0.0.1:8080 --url b:https://api.example.com/v1 --api-key b:$B_KEY` |
 | **Your own servers** | Works with the model servers people usually run: Ollama, LM Studio, llama-server, vLLM, and other OpenAI-compatible servers. | `agent-switch codex --provider ollama` |
 | **Your setup stays as it is** | Leave out `--url` and `--provider`, and the agent runs as usual, with its own model, account, and settings. | `agent-switch claude` |
@@ -130,6 +131,20 @@ agent-switch codex --mcp-all
 Without a local model server, these tools are added to the agent's existing tools.
 With `--url` or `--provider`, the selected MCP servers replace the agent's own MCP servers
 for that session. [Registry format, authentication, and examples](docs/reference.md#mcp-servers).
+
+## Add a skill for one session
+
+```sh
+agent-switch claude --skill /tmp/skills/my-test-skill
+agent-switch codex --skill skill1:/tmp/skills/my-test-skill --skill /tmp/skills/my-test-skill2
+```
+
+- `--skill` works with or without `--url` or `--provider`.
+- Add `NAME:` before a path to give that skill a different name.
+- An injected skill wins a same-name clash, with the agent-specific exceptions in the reference.
+- Edits show up live. If renaming rewrites `SKILL.md`, edit the source and restart to refresh the copy.
+
+[Skill paths, file handling, and name clashes](docs/reference.md#session-skills).
 
 ## DeepSeek Harness
 

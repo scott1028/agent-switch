@@ -26,6 +26,7 @@ from agent_switch.core.launch import (
     _run_native,
 )
 from agent_switch.core.mcp import load_mcp_servers
+from agent_switch.core.overlay import write_native_overlay
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -54,6 +55,7 @@ from agent_switch.core.options import (
     _REASONING_EFFORT_OPTION,
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
+    _SKILL_OPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
     _TOP_P_OPTION,
@@ -75,6 +77,7 @@ from agent_switch.core.platform import (
     _wsl_windows_executable,
 )
 from agent_switch.core.session import _agent_config_path, _session_config
+from agent_switch.core.skills import load_skills, write_skills_overlay
 from agent_switch.core.storage import _read_json_object, _subdict, _write_private_json
 
 
@@ -397,25 +400,38 @@ def _clear_pi_user_resources(agent_dir: Path, home: Path) -> None:
     manifest_path.unlink(missing_ok = True)
 
 
-def write_pi_user_resources(agent_dir: Path, home: Path) -> None:
-    """Expose selected user Pi resources inside an isolated session."""
-    if _wsl_windows_executable(["pi"]):
-        # Windows Pi cannot reliably follow WSL links into mounted drives, and a session
-        # an earlier Linux pi prepared still holds them, so drop those before returning.
-        _clear_pi_user_resources(agent_dir, home)
-        return
-    user_home = Path.home()
+def _get_pi_source_agent_dir(agent_dir: Path) -> Path:
     configured = os.environ.get("PI_CODING_AGENT_DIR")
     configured = configured.strip() if configured else ""
     # Pi resolves a relative override from the launch directory.
     source = (
         Path(os.path.abspath(os.path.expanduser(configured)))
         if configured
-        else user_home / ".pi" / "agent"
+        else Path.home() / ".pi" / "agent"
     )
     if source.resolve(strict = False) == agent_dir.resolve(strict = False):
         # Do not treat this session as its own resource source.
-        source = user_home / ".pi" / "agent"
+        source = Path.home() / ".pi" / "agent"
+    return source
+
+
+def write_pi_user_resources(agent_dir: Path, home: Path, *, skills: Optional[dict] = None) -> None:
+    """Expose selected user Pi resources inside an isolated session."""
+    skills_root = agent_dir / "skills"
+    if (
+        skills is None and not skills_root.is_symlink() and not _is_junction(skills_root)
+        and (skills_root / ".agent-switch-skills.json").is_file()
+    ):
+        _remove_overlay_entry(skills_root)
+    if _wsl_windows_executable(["pi"]):
+        # Windows Pi cannot reliably follow WSL links into mounted drives.
+        _clear_pi_user_resources(agent_dir, home)
+        if skills is not None:
+            write_skills_overlay(skills_root, None, skills, should_copy = True)
+        return
+    user_home = Path.home()
+    source = _get_pi_source_agent_dir(agent_dir)
+    configured = (os.environ.get("PI_CODING_AGENT_DIR") or "").strip()
     if configured and not source.is_dir():
         # Otherwise this looks exactly like the bug this function exists to fix.
         typer.echo(
@@ -423,8 +439,11 @@ def write_pi_user_resources(agent_dir: Path, home: Path) -> None:
             "no Pi extensions or packages will load in this session.",
             err = True,
         )
+    if skills is not None:
+        write_skills_overlay(skills_root, source / "skills", skills)
     linked = frozenset(
-        name for name in _PI_USER_RESOURCE_DIRS if _link_user_dir(source / name, agent_dir / name)
+        name for name in _PI_USER_RESOURCE_DIRS
+        if (name == "skills" and skills is not None) or _link_user_dir(source / name, agent_dir / name)
     )
     # HOME is relocated, so link Pi's other global skill directory too.
     user_skills = user_home / ".agents" / "skills"
@@ -572,6 +591,7 @@ def pi(
     mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
+    skill: Optional[list[str]] = _SKILL_OPTION,
 ):
     """Point Pi (coding agent) at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -585,6 +605,7 @@ def pi(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
+    skills = load_skills(skill, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(
@@ -609,6 +630,11 @@ def pi(
     alias = ctx.meta.get(_ALIAS_META)
     if alias and as_subagent:
         _fail("--as-subagent is not supported for agent aliases.")
+    if alias and skills:
+        _fail(
+            "--skill is not supported for pi aliases: the alias sets its own PI_CODING_AGENT_DIR; "
+            "use `agent-switch pi`."
+        )
     if alias and target is not None:
         # The function sets its own PI_CODING_AGENT_DIR, which outranks the session env, so the
         # session models.json with the local provider and key would be silently ignored.
@@ -626,12 +652,28 @@ def pi(
         _check_alias(alias)
     else:
         _require_agent_for_launch("pi", install_hint, launch)
+    should_copy_skills = bool(skills and _wsl_windows_executable(["pi"]))
+    if should_copy_skills:
+        typer.echo(
+            "Note: pi runs as a Windows program, so injected skills are copied; "
+            "restart to pick up edits."
+        )
     if target is None:
-        # Native launch: pi keeps its own model, login and config (HOME and
-        # PI_CODING_AGENT_DIR untouched); mounted servers only ride --mcp-config. Pi itself has
+        # Without skills, native launch leaves HOME and PI_CODING_AGENT_DIR untouched.
+        # Mounted servers only ride --mcp-config. Pi itself has
         # no such flag and rejects it; it works only with an extension that registers the flag,
         # such as pi-mcp-adapter.
         with _session_config("pi-native", launch) as config:
+            env = {}
+            if skills:
+                agent_dir = config / "agent"
+                write_native_overlay(
+                    agent_dir, _get_pi_source_agent_dir(agent_dir), skills = skills,
+                    should_copy_skills = should_copy_skills,
+                )
+                env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+            else:
+                _remove_overlay_entry(config / "agent")
             mcp_path = config / "mcp.json"
             mcp_flags = []
             if mcp_servers:
@@ -650,7 +692,7 @@ def pi(
             )
             _run_native(
                 alias or "pi",
-                {},
+                env,
                 command,
                 launch = launch,
                 install_hint = install_hint,
@@ -755,7 +797,7 @@ def pi(
             headers = headers,
             served_models = served_models,
         )
-        write_pi_user_resources(pi_agent_dir, home)
+        write_pi_user_resources(pi_agent_dir, home, skills = skills)
         write_pi_compaction(pi_agent_dir, entry, compact_at, served_models)
         # Pi's built-in MCP (since 0.99.0) reads <agentDir>/mcp.json (as does the user's pi-mcp-adapter);
         # HOME and PI_CODING_AGENT_DIR are already the session's, so this file replaces the

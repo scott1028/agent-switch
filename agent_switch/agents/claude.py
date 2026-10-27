@@ -58,6 +58,7 @@ from agent_switch.core.options import (
     _REASONING_EFFORT_OPTION,
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
+    _SKILL_OPTION,
     _SUBAGENT_DESCRIPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
@@ -72,6 +73,7 @@ from agent_switch.core.options import (
 )
 from agent_switch.core.platform import _merge_wslenv, _wsl_bridge_names, _wsl_windows_executable
 from agent_switch.core.session import _agent_config_path, _session_config
+from agent_switch.core.skills import load_skills, write_skills
 from agent_switch.core.storage import _write_private_json, _write_private_text
 from agent_switch.providers.utils import get_has_custom_authorization
 
@@ -219,16 +221,15 @@ def _claude_local_command(
     settings: str,
     yolo: bool,
     passthrough: list,
-    mcp_flags: Optional[list] = None,
+    session_flags: Optional[list] = None,
 ) -> list:
     local_args = [
         "--model",
         model_id,
         *_claude_flags(model_id, settings),
         *_yolo_command_flags("claude", yolo),
-        # The `=` form: --mcp-config is variadic in claude, so a detached value would swallow the
-        # first forwarded positional, same reason as --allowedTools in the subagent command.
-        *(mcp_flags or []),
+        # The `=` form keeps variadic --mcp-config and --add-dir from swallowing positionals.
+        *(session_flags or []),
     ]
     forwarded = _drop_overridden_args(
         "claude", passthrough, ["--model", model_id, *_yolo_command_flags("claude", yolo)]
@@ -434,6 +435,24 @@ def write_claude_subagent_plugin(path: Path, server_env: dict) -> Path:
     return plugin
 
 
+def _get_claude_skill_flags(config: Path, skills: Optional[dict]) -> list:
+    directory = config / "agent-switch"
+    should_copy = bool(skills and _wsl_windows_executable(["claude"]))
+    write_skills(directory / ".claude" / "skills", skills, should_copy = should_copy)
+    if not skills:
+        return []
+    if should_copy:
+        typer.echo(
+            "Note: claude runs as a Windows program, so injected skills are copied; "
+            "restart to pick up edits."
+        )
+    typer.echo(
+        f"Injected skills: {', '.join(skills)}. If one shares a name with an existing skill, "
+        "Claude lists it as agent-switch:<name>."
+    )
+    return [f"--add-dir={_agent_config_path(directory, ['claude'])}"]
+
+
 def claude(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
@@ -463,6 +482,7 @@ def claude(
     mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
+    skill: Optional[list[str]] = _SKILL_OPTION,
 ):
     """Point Claude Code at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -476,6 +496,7 @@ def claude(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
+    skills = load_skills(skill, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(
@@ -513,20 +534,21 @@ def claude(
         # mounted servers are only added through --mcp-config (no --strict-mcp-config).
         with _session_config("claude-native", launch) as config:
             mcp_config = config / "mcp.json"
-            mcp_flags = []
+            session_flags = []
             if mcp_servers:
                 _write_claude_mcp_config(mcp_config, mcp_servers)
                 # The `=` form: --mcp-config is variadic in claude, so a detached value would
                 # swallow the first forwarded positional.
-                mcp_flags = [f"--mcp-config={_agent_config_path(mcp_config, ['claude'])}"]
+                session_flags = [f"--mcp-config={_agent_config_path(mcp_config, ['claude'])}"]
             else:
                 mcp_config.unlink(missing_ok = True)
+            session_flags.extend(_get_claude_skill_flags(config, skills))
             command = _agent_command(
                 alias,
                 "claude",
                 [
                     *_yolo_command_flags("claude", yolo),
-                    *mcp_flags,
+                    *session_flags,
                     *_drop_overridden_args("claude", ctx.args, _yolo_command_flags("claude", yolo)),
                 ],
             )
@@ -606,7 +628,7 @@ def claude(
         settings = _write_claude_settings(
             config, model_id, env, [served["id"] for served in served_models]
         )
-        mcp_flags = []
+        session_flags = []
         mcp_config = config / "mcp.json"
         if mcp_servers:
             _write_claude_mcp_config(mcp_config, mcp_servers)
@@ -614,16 +636,17 @@ def claude(
             # project-level MCP servers and reads only this file. The flags go only with mounted
             # servers, so a persisted session without MCP flags keeps claude's own behavior.
             mcp_path = _agent_config_path(mcp_config, ["claude"])
-            mcp_flags = ["--strict-mcp-config", f"--mcp-config={mcp_path}"]
+            session_flags = ["--strict-mcp-config", f"--mcp-config={mcp_path}"]
         else:
             # As in pi(): a persisted session dir must not keep an earlier mount's expanded secrets.
             mcp_config.unlink(missing_ok = True)
+        session_flags.extend(_get_claude_skill_flags(config, skills))
         command = _claude_local_command(
             model_id,
             _agent_config_path(settings, ["claude"]),
             yolo,
             ctx.args,
-            mcp_flags,
+            session_flags,
         )
         if alias:
             # The alias function replaces only argv[0]; the unset inside the bash string

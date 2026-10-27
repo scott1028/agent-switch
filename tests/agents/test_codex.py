@@ -24,6 +24,7 @@ from agent_switch.agents import (
 )
 from agent_switch.core import (
     session as core_session,
+    skills as core_skills,
 )
 from tests.cli_support import (
     BASE,
@@ -32,6 +33,7 @@ from tests.cli_support import (
     _SESSION_FLAGS,
     _assert_env_set,
     _assert_env_unset,
+    _assert_windows_agent_copies_injected_skills,
     _capture_launch,
     _launch_command,
     _mcp_registry,
@@ -41,9 +43,52 @@ from tests.cli_support import (
 from tests.start_split import set_start_attr
 
 
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_windows_codex_copies_injected_skills(fake_vllm, tmp_path, monkeypatch, is_routed):
+    _assert_windows_agent_copies_injected_skills(
+        fake_vllm, tmp_path, monkeypatch, "codex", "codex", is_routed
+    )
+
+
 def _assert_env_kept(output: str, name: str) -> None:
     needle = f"Remove-Item Env:{name}" if os.name == "nt" else f"unset {name}"
     assert needle not in output, f"{needle!r} unexpectedly found in:\n{output}"
+
+
+def _snapshot_skill_tree(root):
+    return {
+        str(path.relative_to(root)): (
+            ("link", os.readlink(path)) if path.is_symlink() else
+            ("file", path.read_bytes()) if path.is_file() else ("directory",)
+        )
+        for path in root.rglob("*")
+    }
+
+
+@pytest.fixture
+def codex_skill_sources(tmp_path, monkeypatch):
+    home = tmp_path / "user-codex"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        'model = "cloud-model"\n[[skills.config]]\nname = "disabled"\nenabled = false\n'
+    )
+    (home / "auth.json").write_text('{"auth": "cloud"}\n')
+    (home / "AGENTS.md").write_text("User instructions.\n")
+    (home / "AGENTS.override.md").write_text("User override.\n")
+    (home / "sessions").mkdir()
+    for name in ["shared", "user-only", ".system"]:
+        child = home / "skills" / name
+        child.mkdir(parents = True)
+        (child / "SKILL.md").write_text(f"---\nname: {name}\ndescription: USER\n---\n")
+    source = tmp_path / "injected" / "shared"
+    source.mkdir(parents = True)
+    (source / "SKILL.md").write_text("---\nname: shared\ndescription: INJECTED\n---\nBody.\n")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    before_home = _snapshot_skill_tree(home)
+    before_source = _snapshot_skill_tree(source)
+    yield home, source
+    assert _snapshot_skill_tree(home) == before_home
+    assert _snapshot_skill_tree(source) == before_source
 
 
 def test_codex_catalog_probes_old_codex_only_in_install_dir(monkeypatch, tmp_path):
@@ -429,7 +474,7 @@ def test_ephemeral_codex_parent_overlay_is_cleaned_with_session(tmp_path, monkey
         assert overlay.exists()
         assert session_home.exists()
 
-    assert not overlay.exists()
+    assert not os.path.lexists(overlay)
     assert not session_home.exists()
 
 
@@ -1001,3 +1046,201 @@ def test_native_codex_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", *flag])
     assert result.exit_code == 1
     assert "needs --url or --provider" in result.output
+
+
+def test_native_codex_skill_uses_additive_overlay_and_rules(fake_vllm, tmp_path, monkeypatch, codex_skill_sources):
+    home, source = codex_skill_sources
+    before_home = _snapshot_skill_tree(home)
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(
+        start.start_app,
+        ["codex", "--no-launch", "--skill", str(source), "--skill", f"renamed:{source}",
+         "--", "exec", "hello"],
+    )
+    assert result.exit_code == 0, result.output
+    overlay = tmp_path / "agents" / "codex-native" / "home"
+    _assert_env_set(result.output, "CODEX_HOME", str(overlay))
+    for name in ["config.toml", "auth.json", "sessions", "AGENTS.md", "AGENTS.override.md"]:
+        assert (overlay / name).is_symlink()
+        assert (overlay / name).resolve() == home / name
+    assert not (overlay / "skills").is_symlink()
+    for name in ["user-only", ".system"]:
+        assert (overlay / "skills" / name).is_symlink()
+        assert (overlay / "skills" / name).resolve() == home / "skills" / name
+    assert (overlay / "skills" / "shared").resolve() == source
+    renamed = overlay / "skills" / "renamed"
+    assert renamed.is_dir() and not renamed.is_symlink()
+    assert "name: renamed\n" in (renamed / "SKILL.md").read_text()
+    command = _launch_command(result.output)
+    assert command[-2:] == ["exec", "hello"]
+    assert command[1] == "-c"
+    assert _parse_toml(command[2])["skills"]["config"] == [
+        {"name": "shared", "enabled": False},
+        {"path": str(overlay / "skills" / "shared" / "SKILL.md"), "enabled": True},
+        {"name": "renamed", "enabled": False},
+        {"path": str(renamed / "SKILL.md"), "enabled": True},
+    ]
+    cleared = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--", "exec", "hello"])
+    assert cleared.exit_code == 0, cleared.output
+    assert _launch_command(cleared.output) == ["codex", "exec", "hello"]
+    assert not overlay.exists()
+    assert _snapshot_skill_tree(home) == before_home
+
+
+def test_native_codex_without_skill_keeps_existing_home_and_command(fake_vllm, tmp_path, monkeypatch, codex_skill_sources):
+    _native_no_connect(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--", "exec", "hello"])
+    assert result.exit_code == 0, result.output
+    assert _launch_command(result.output) == ["codex", "exec", "hello"]
+    assert "CODEX_HOME" not in result.output
+    assert not (tmp_path / "agents" / "codex-native" / "home").exists()
+
+
+@pytest.mark.parametrize("should_persist", [False, True])
+def test_routed_codex_skill_rules_and_entries_clear_on_rerun(fake_vllm, tmp_path, codex_skill_sources, should_persist):
+    home, source = codex_skill_sources
+    root = tmp_path / "agents" / "codex" / "skills"
+    (root / ".system").mkdir(parents = True)
+    (root / ".system" / "keep.txt").write_text("Keep system skills.\n")
+    base_args = ["codex", "--url", BASE, "--no-launch", *(["--persist"] if should_persist else [])]
+    before = _snapshot_skill_tree(home)
+    result = CliRunner().invoke(
+        start.start_app,
+        [*base_args, "--skill", str(source), "--skill", f"renamed:{source}", "--", "exec", "hello"],
+    )
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    assert command[:4] == ["codex", "--oss", "--profile", "agent_switch"]
+    assert command[-2:] == ["exec", "hello"]
+    rules = _parse_toml(command[command.index("-c") + 1])["skills"]["config"]
+    assert rules == [
+        {"name": "shared", "enabled": False},
+        {"path": str(root / "shared" / "SKILL.md"), "enabled": True},
+        {"name": "renamed", "enabled": False},
+        {"path": str(root / "renamed" / "SKILL.md"), "enabled": True},
+    ]
+    assert (root / "shared").resolve() == source
+    assert not (root / "renamed").is_symlink()
+    assert "name: renamed\n" in (root / "renamed" / "SKILL.md").read_text()
+    assert _snapshot_skill_tree(home) == before
+    result = CliRunner().invoke(start.start_app, [*base_args, "--", "exec", "hello"])
+    assert result.exit_code == 0, result.output
+    assert not os.path.lexists(root / "shared") and not (root / "renamed").exists()
+    assert "skills.config" not in result.output
+    assert (root / ".system" / "keep.txt").read_text() == "Keep system skills.\n"
+    assert _snapshot_skill_tree(home) == before
+
+
+@pytest.mark.parametrize(("agent", "flags", "message"), [
+    ("codex-personal", [], "CODEX_HOME"),
+    ("codex", ["--url", BASE, "--as-subagent"], "--skill cannot be combined with --as-subagent."),
+])
+def test_codex_skill_refuses_alias_and_subagent_before_launch(fake_vllm, monkeypatch, codex_skill_sources, agent, flags, message):
+    _, source = codex_skill_sources
+    _native_no_connect(monkeypatch)
+    set_start_attr(monkeypatch, "_check_alias", lambda *args: pytest.fail("alias must be rejected"))
+    result = CliRunner().invoke(
+        start.start_app, [agent, *flags, "--no-launch", "--skill", str(source)]
+    )
+    assert result.exit_code == 1
+    assert message in result.output
+
+
+def test_codex_skill_flags_translate_paths_and_escape_toml(monkeypatch):
+    root = Path("session") / "skills"
+    calls = []
+
+    def translate(path, command):
+        calls.append((path, command))
+        return r'C:\Users\someone\session\skills\shared\SKILL.md'
+
+    monkeypatch.setattr(codex_agent, "_agent_config_path", translate)
+    flags = codex_agent._get_codex_skill_flags(root, {"shared": Path("source")})
+    assert flags[0] == "-c"
+    assert _parse_toml(flags[1])["skills"]["config"] == [
+        {"name": "shared", "enabled": False},
+        {"path": r'C:\Users\someone\session\skills\shared\SKILL.md', "enabled": True},
+    ]
+    assert calls == [(root / "shared" / "SKILL.md", ["codex"])]
+    assert codex_agent._get_codex_skill_flags(root, None) == []
+
+
+def test_write_codex_parent_overlay_rebuilds_owned_skills_without_routing(tmp_path, codex_skill_sources):
+    home, source = codex_skill_sources
+    overlay = tmp_path / "managed" / "home"
+    codex_agent.write_codex_parent_overlay(overlay, routing = None, skills = {"shared": source})
+    manifest = json.loads((overlay / codex_agent._CODEX_PARENT_OVERLAY_MANIFEST).read_text())
+    assert "skills" in manifest["entries"]
+    codex_agent.write_codex_parent_overlay(overlay, routing = None, skills = {"renamed": source})
+    assert (overlay / "skills" / "shared").resolve() == home / "skills" / "shared"
+    assert (overlay / "skills" / "renamed").is_dir()
+    codex_agent.write_codex_parent_overlay(overlay, routing = None)
+    assert (overlay / "skills").is_symlink()
+    assert (overlay / "skills").resolve() == home / "skills"
+    assert not (overlay / "skills" / "renamed").exists()
+
+
+def test_write_codex_parent_overlay_keeps_source_skill_manifest_private(tmp_path, monkeypatch):
+    home = tmp_path / "user-codex"
+    user_skill = home / "skills" / "user-only"
+    user_skill.mkdir(parents = True)
+    (user_skill / "SKILL.md").write_text("User skill.\n")
+    (home / "skills" / ".agent-switch-skills.json").write_text('{"entries": ["user-only"]}\n')
+    source = tmp_path / "injected"
+    source.mkdir()
+    (source / "SKILL.md").write_text("Injected skill.\n")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    before = _snapshot_skill_tree(home)
+    overlay = codex_agent.write_codex_parent_overlay(
+        tmp_path / "overlay", routing = None, skills = {"injected": source}
+    )
+    assert _snapshot_skill_tree(home) == before
+    assert (overlay / "skills" / "user-only").resolve() == user_skill
+    assert not (overlay / "skills" / ".agent-switch-skills.json").is_symlink()
+
+
+@pytest.mark.parametrize("is_routed", [False, True])
+def test_codex_skill_launch_matches_no_launch_recipe(fake_vllm, tmp_path, monkeypatch, codex_skill_sources, is_routed):
+    _, source = codex_skill_sources
+    args = ["codex", *(["--url", BASE, "--persist"] if is_routed else []), "--skill", str(source)]
+    recipe = CliRunner().invoke(start.start_app, [*args, "--no-launch", "--", "exec", "hello"])
+    assert recipe.exit_code == 0, recipe.output
+    recipe_home = tmp_path / "agents" / ("codex" if is_routed else "codex-native")
+    if not is_routed:
+        recipe_home /= "home"
+    captured = {}
+
+    def launch(command, env, **kwargs):
+        captured.update(command = command, env = env)
+        assert (Path(env["CODEX_HOME"]) / "skills" / "shared" / "SKILL.md").is_file()
+        return 0
+
+    set_start_attr(monkeypatch, "_launch", launch)
+    launched = CliRunner().invoke(start.start_app, [*args, "--", "exec", "hello"])
+    assert launched.exit_code == 0, launched.output
+    actual_home = captured["env"]["CODEX_HOME"]
+    assert captured["command"] == [
+        part.replace(str(recipe_home), actual_home) for part in _launch_command(recipe.output)
+    ]
+    for name, env_value in captured["env"].items():
+        _assert_env_set(recipe.output, name, str(recipe_home) if name == "CODEX_HOME" else env_value)
+
+
+def test_write_codex_parent_overlay_copies_user_skill_children_when_links_fail(tmp_path, monkeypatch, codex_skill_sources):
+    home, source = codex_skill_sources
+
+    def deny_symlink(*args, **kwargs):
+        raise OSError("Symlinks unavailable.")
+
+    monkeypatch.setattr(Path, "symlink_to", deny_symlink)
+    set_start_attr(monkeypatch, "_create_directory_junction", lambda *args: False)
+    monkeypatch.setattr(core_skills, "_create_directory_junction", lambda *args: False)
+    overlay = codex_agent.write_codex_parent_overlay(
+        tmp_path / "overlay", routing = None, skills = {"shared": source}
+    )
+    for name in ["user-only", ".system"]:
+        copied = overlay / "skills" / name
+        assert not copied.is_symlink()
+        assert (copied / "SKILL.md").read_bytes() == (home / "skills" / name / "SKILL.md").read_bytes()
+    assert (overlay / "skills" / "shared" / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+    assert (overlay / "AGENTS.md").read_bytes() == (home / "AGENTS.md").read_bytes()

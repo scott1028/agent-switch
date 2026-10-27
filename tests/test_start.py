@@ -282,7 +282,7 @@ def test_agent_help_draws_each_table_panel(monkeypatch, title, rows):
 
 # The eli5 help budget: each agent subcommand stays short at 80 columns. The details live in
 # the README, so growing an option's help past this line is a deliberate change to review.
-_AGENT_HELP_MAX_LINES = 181
+_AGENT_HELP_MAX_LINES = 184
 
 
 @pytest.mark.parametrize("agent", ["claude", "codex", "opencode", "pi", "dsh"])

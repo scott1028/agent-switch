@@ -5,6 +5,7 @@
 
 import os
 import re
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -62,6 +63,7 @@ from agent_switch.core.options import (
     _REASONING_FIELDS,
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
+    _SKILL_OPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
     _TOP_P_OPTION,
@@ -84,6 +86,7 @@ from agent_switch.core.session import (
     _ephemeral_session_prefix,
     _session_config,
 )
+from agent_switch.core.skills import load_skills, write_skills
 from agent_switch.core.storage import _read_json_object, _write_private_json, _write_private_text
 
 
@@ -114,6 +117,9 @@ _DSH_TUI_AGENT = "dsh-tui"
 
 
 _DSH_TUI_COMMANDS = ("dsh-tui", "dst")
+
+
+_DSH_TUI_SKILL_PRESETS = ("standard", "ptc", "liangshen")
 
 
 _DSH_LAUNCHER_ARGS = frozenset(
@@ -360,6 +366,16 @@ def _dsh_model_entry(
     return entry
 
 
+def _get_dsh_skill_rows(skills_root: str, *, is_tui: bool) -> list:
+    if not is_tui:
+        return [{"id": "skill-filesystem", "config": {"customSkillDirs": [skills_root]}}]
+    return [{"insert": [{
+        "id": f"agent-switch-skills-{preset}",
+        "name": "@deepseek-harness-tui/dsh-tui/preset-patch",
+        "config": {"preset": preset, "config": {"skill-filesystem": {"customSkillDirs": [skills_root]}}},
+    }]} for preset in _DSH_TUI_SKILL_PRESETS]
+
+
 def write_dsh_patch(
     base: str,
     model: dict,
@@ -372,6 +388,7 @@ def write_dsh_patch(
     is_tui: bool = False,
     mcp_servers: Optional[dict] = None,
     served_models: Optional[list] = None,
+    skills_root: Optional[str] = None,
 ) -> None:
     """Write the dsh loader patch that points the booted profile at the model server.
 
@@ -451,6 +468,8 @@ def write_dsh_patch(
                 ]
             }
         )
+    if skills_root is not None:
+        entries.extend(_get_dsh_skill_rows(skills_root, is_tui = is_tui))
     # /settings lives in ~/.dsh-tui/settings.json, a user layer above this row.
     if is_tui:
         # A patch row replaces dsh-tui's whole config block (no deep merge), so restate the eight
@@ -489,12 +508,15 @@ def write_dsh_patch(
         typer.echo(f"Updated {path}")
 
 
-def _write_dsh_mcp_patch(path: Path, mcp_servers: dict) -> None:
-    """A native-mode patch carrying only the MCP insert row; the user's own profile stays put."""
+def _write_dsh_mcp_patch(
+    path: Path, mcp_servers: dict, *, skills_root: Optional[str] = None, is_tui: bool = False,
+) -> None:
+    """A native MCP/skills patch that leaves the user's own profile unchanged."""
     import yaml
 
-    entries = [
-        {
+    entries = []
+    if mcp_servers:
+        entries.append({
             "insert": [
                 {
                     "id": f"mcp-{name}",
@@ -503,8 +525,9 @@ def _write_dsh_mcp_patch(path: Path, mcp_servers: dict) -> None:
                 }
                 for name, server in mcp_servers.items()
             ]
-        }
-    ]
+        })
+    if skills_root is not None:
+        entries.extend(_get_dsh_skill_rows(skills_root, is_tui = is_tui))
     text = yaml.dump(entries, sort_keys = False)
     if not path.exists() or path.read_text(encoding = "utf-8") != text:
         # Private: a --header value may be a token.
@@ -731,6 +754,42 @@ def _get_dsh_source_home(dsh_home: Path) -> Path:
     return source
 
 
+def _check_dsh_tui_skills(dsh_home: Path, home: Path, *, is_native: bool) -> None:
+    """Require the profile's runtime export and explain the supported preset scope."""
+    profile = dsh_home / "profiles" / "dsh-tui"
+    package = profile / "node_modules" / "@deepseek-harness-tui" / "dsh-tui"
+    manifest = package / "package.json"
+    if not manifest.is_file():
+        _fail(
+            f"--skill needs the dsh-tui profile in {profile}; start dsh-tui once without "
+            "--skill to install it, then retry."
+        )
+    metadata = _read_json_object(manifest) or {}
+    exports = metadata.get("exports")
+    target = exports.get("./preset-patch") if isinstance(exports, dict) else None
+    if isinstance(target, dict):
+        target = target.get("import") or target.get("default")
+    if not isinstance(target, str) or not target.startswith("./") or not (package / target).is_file():
+        update = "dsh-tui update"
+        if not is_native:
+            env = {**_get_dsh_tui_env(home), "DSH_HOME": str(dsh_home)}
+            update = " ".join([*(f"{name}={shlex.quote(value)}" for name, value in env.items()), update])
+        _fail(
+            f"--skill needs dsh-tui 0.17 or newer in {profile} "
+            f"(found {metadata.get('version', 'unknown')}); run `{update}`."
+        )
+    preset = (os.environ.get("DSH_TUI_PRESET") or "").strip() if is_native else None
+    if not preset:
+        preferences = _read_json_object(home / ".dsh-tui" / "agent-preset.json") or {}
+        preset = preferences.get("preset")
+    if isinstance(preset, str) and preset and preset not in _DSH_TUI_SKILL_PRESETS:
+        typer.echo(
+            f"Warning: injected skills do not reach dsh-tui preset {preset!r}; "
+            "use standard, ptc or liangshen.", err = True,
+        )
+    typer.echo("Injected skills reach dsh-tui's standard, ptc and liangshen presets.")
+
+
 def write_dsh_user_resources(dsh_home: Path, *, is_tui: bool) -> None:
     """Link the user's AGENTS.md and skills into an isolated session DSH home."""
     manifest_path = dsh_home / _DSH_USER_RESOURCES_MANIFEST
@@ -805,6 +864,7 @@ def dsh(
     mcp_header: Optional[list[str]] = _MCP_HEADER_OPTION,
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
+    skill: Optional[list[str]] = _SKILL_OPTION,
 ):
     """Point DeepSeek Harness (dsh) at a local model server and start it."""
     # One handler for dsh and the TUI: they share the server route and differ in launch and home.
@@ -813,13 +873,18 @@ def dsh(
     # For an alias like dsh-tui-x, info_name is the alias itself; the group names the kind.
     kind = ctx.meta.get(_ALIAS_KIND_META) or agent
     is_tui = kind != "dsh"
+    if is_tui and alias and skill:
+        _fail(
+            f"--skill is not supported for {kind} aliases: the alias sets its own DSH_HOME "
+            f"and HOME; use `agent-switch {kind}`."
+        )
     raw_persist = persist
     # dsh-tui/dst keep their session home unless --no-persist; dsh stays throwaway unless --persist.
     persist = is_tui if persist is None else persist
     if not url and not provider:
         # Native launch: dsh keeps its real DSH_HOME, HOME and profile, so the guards that
         # protect agent-switch's own routing (its --profile and patch placement) do not apply;
-        # only the MCP flags ride along, as a patch holding just the MCP insert row.
+        # only session MCP and skills ride along in a patch.
         _refuse_local_only(
             model = model,
             max_seq_length = max_seq_length,
@@ -872,13 +937,28 @@ def dsh(
             stdios = mcp_stdio,
             envs = mcp_env,
         )
+        skills = load_skills(skill)
         _check_dsh_mcp_names(mcp_servers)
         with _session_config(f"{_DSH_TUI_AGENT if is_tui else 'dsh'}-native", launch) as home:
+            if is_tui and skills:
+                _check_dsh_tui_skills(_get_dsh_source_home(home), Path.home(), is_native = True)
+            probe = (launcher or _DSH_TUI_AGENT) if is_tui else "dsh"
+            skills_root = home / "skills-injected"
+            should_copy_skills = bool(skills and _wsl_windows_executable([probe]))
+            write_skills(skills_root, skills, should_copy = should_copy_skills)
+            if should_copy_skills:
+                typer.echo(
+                    f"Note: {probe} runs as a Windows program, so injected skills are copied; "
+                    "restart to pick up edits."
+                )
             patch = home / _DSH_PATCH_FILE
             patch_arg = None
-            if mcp_servers:
-                _write_dsh_mcp_patch(patch, mcp_servers)
-                probe = (launcher or _DSH_TUI_AGENT) if is_tui else "dsh"
+            if mcp_servers or skills:
+                _write_dsh_mcp_patch(
+                    patch, mcp_servers,
+                    skills_root = _agent_config_path(skills_root, [probe]) if skills else None,
+                    is_tui = is_tui,
+                )
                 patch_arg = _agent_config_path(patch, [probe])
             else:
                 # Stable --no-launch dir: drop an earlier mount so a bare rerun passes no patch.
@@ -928,6 +1008,7 @@ def dsh(
         stdios = mcp_stdio,
         envs = mcp_env,
     )
+    skills = load_skills(skill)
     _check_dsh_mcp_names(mcp_servers)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     install_hint = _npm_install_hint(_DSH_TUI_PACKAGE if is_tui else _DSH_PACKAGE)
@@ -964,6 +1045,17 @@ def dsh(
             # Recheck the real home: an unwritable agents dir falls back to the system temp dir.
             _check_dsh_tui_home(agent, home)
         dsh_home = home / ".dsh" if is_tui else home
+        if is_tui and skills:
+            _check_dsh_tui_skills(dsh_home, home, is_native = False)
+        probe = launcher if is_tui else "dsh"
+        skills_root = home / "skills-injected"
+        should_copy_skills = bool(skills and _wsl_windows_executable([probe]))
+        write_skills(skills_root, skills, should_copy = should_copy_skills)
+        if should_copy_skills:
+            typer.echo(
+                f"Note: {probe} runs as a Windows program, so injected skills are copied; "
+                "restart to pick up edits."
+            )
         patch = home / _DSH_PATCH_FILE
         write_dsh_patch(
             base,
@@ -977,6 +1069,7 @@ def dsh(
             is_tui = is_tui,
             mcp_servers = mcp_servers,
             served_models = served_models,
+            skills_root = _agent_config_path(skills_root, [probe]) if skills else None,
         )
         # A Windows dsh under WSL gets DSH_HOME translated through WSLENV, but not argv.
         if is_tui:

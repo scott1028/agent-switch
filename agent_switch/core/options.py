@@ -363,6 +363,15 @@ _MCP_STDIO_OPTION = typer.Option(
 )
 
 
+_SKILL_OPTION = typer.Option(
+    None,
+    "--skill",
+    metavar = "[NAME:]PATH",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Add a skill folder for this session; NAME: renames it.",
+)
+
+
 _MCP_ENV_OPTION = typer.Option(
     None,
     "--mcp-env",
