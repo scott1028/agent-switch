@@ -274,6 +274,10 @@ _CODEX_PATCH_LINE_ENDINGS_REMOVED_VERSION = (0, 162, 0)
 _CODEX_PROFILE_MIN_VERSION = (0, 134, 0)
 
 
+# Older Codex needs a path in every skills.config rule, so native --skill cannot disable by name.
+_CODEX_SKILL_NAME_MIN_VERSION = (0, 117, 0)
+
+
 # Older Codex sends no reasoning for a model without reasoning summaries, and older Pi has no samplingParams.
 _CODEX_REASONING_REQUEST_MIN_VERSION = (0, 145, 0)
 
@@ -560,6 +564,8 @@ def write_codex_parent_overlay(
     return overlay
 
 
+# Injected skills live in $CODEX_HOME/skills, which Codex keeps only as a deprecated user root
+# (references/codex/codex-rs/ext/skills/src/host_roots.rs:96-97).
 def _get_codex_skill_flags(root: Path, skills: Optional[dict]) -> list:
     rules = []
     for name in skills or {}:
@@ -693,6 +699,13 @@ def codex(
             "restart to pick up edits."
         )
     if target is None:
+        # Native --skill writes name-only rules; --no-launch or unparseable keeps going.
+        version = _codex_executable_version(executable) if executable and skills else None
+        if version is not None and version < _CODEX_SKILL_NAME_MIN_VERSION:
+            _fail(
+                f"Codex {'.'.join(map(str, version))} is too old for --skill; "
+                f"0.117.0 or newer is needed. Upgrade it with: {install_hint}"
+            )
         # Without injected skills, native launch leaves CODEX_HOME untouched.
         with _session_config("codex-native", launch) as config:
             env = {}

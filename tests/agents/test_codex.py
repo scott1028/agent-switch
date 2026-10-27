@@ -1096,6 +1096,31 @@ def test_native_codex_without_skill_keeps_existing_home_and_command(fake_vllm, t
     assert not (tmp_path / "agents" / "codex-native" / "home").exists()
 
 
+@pytest.mark.parametrize(("version", "extra", "should_fail"), [
+    ((0, 116, 0), [], True),
+    ((0, 117, 0), [], False),
+    (None, [], False),
+    ((0, 116, 0), ["--no-launch"], False),
+])
+def test_native_codex_skill_before_name_rules_fails_early(
+    version, extra, should_fail, fake_vllm, monkeypatch, codex_skill_sources
+):
+    # Codex < 0.117.0 needs a path in every skills.config rule.
+    _, source = codex_skill_sources
+    _native_no_connect(monkeypatch)
+    set_start_attr(monkeypatch, "_require_agent_for_launch",
+        lambda name, hint, launch: "/bin/codex" if launch else None,
+    )
+    set_start_attr(monkeypatch, "_codex_executable_version", lambda executable: version)
+    set_start_attr(monkeypatch, "_launch", lambda *args, **kwargs: 0)
+    result = CliRunner().invoke(start.start_app, ["codex", *extra, "--skill", str(source)])
+    if should_fail:
+        assert result.exit_code != 0
+        assert "0.117.0" in result.output
+    else:
+        assert result.exit_code == 0, result.output
+
+
 @pytest.mark.parametrize("should_persist", [False, True])
 def test_routed_codex_skill_rules_and_entries_clear_on_rerun(fake_vllm, tmp_path, codex_skill_sources, should_persist):
     home, source = codex_skill_sources

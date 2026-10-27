@@ -20,19 +20,45 @@ from agent_switch.core.storage import _read_json_object, _write_private_json
 _SKILL_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
-_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)^---(?:\r?\n|\Z)", re.MULTILINE | re.DOTALL)
+# Skip one leading BOM like Pi (references/pi/packages/coding-agent/src/utils/frontmatter.ts).
+_FRONTMATTER_RE = re.compile(r"\A\ufeff?---\r?\n(.*?)^---(?:\r?\n|\Z)", re.MULTILINE | re.DOTALL)
 
 
-def get_skill_name(skill_dir: Path) -> Optional[str]:
+def _sanitize_frontmatter(frontmatter: str) -> str:
+    lines = []
+    for line in re.split(r"\r?\n", frontmatter):
+        entry = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)", line)
+        value = entry.group(2).strip() if entry else ""
+        if value in ("", ">", "|") or value.startswith(("\"", "'")) or ":" not in value:
+            lines.append(line)
+        else:
+            lines.extend([f"{entry.group(1)}: |-", f"  {value}"])
+    return "\n".join(lines)
+
+
+def get_skill_name(skill_dir: Path, *, should_fail: bool = True) -> Optional[str]:
     """Read a string name from the leading SKILL.md YAML frontmatter, when present."""
     path = skill_dir / "SKILL.md"
-    match = _FRONTMATTER_RE.match(path.read_text(encoding = "utf-8"))
+    try:
+        text = path.read_text(encoding = "utf-8")
+    except (OSError, UnicodeDecodeError):
+        if should_fail:
+            raise
+        return None
+    match = _FRONTMATTER_RE.match(text)
     if match is None:
         return None
     try:
         metadata = yaml.safe_load(match.group(1))
     except yaml.YAMLError as exc:
-        _fail(f"Could not parse skill frontmatter in {path}: {exc}")
+        # Agents accept unquoted colons in values; retry them as block scalars like OpenCode's
+        # sanitize (references/opencode/packages/core/src/config/markdown.ts).
+        try:
+            metadata = yaml.safe_load(_sanitize_frontmatter(match.group(1)))
+        except yaml.YAMLError:
+            if not should_fail:
+                return None
+            _fail(f"Could not parse skill frontmatter in {path}: {exc}")
     name = metadata.get("name") if isinstance(metadata, dict) else None
     return name if isinstance(name, str) else None
 
@@ -99,21 +125,24 @@ def write_skills(root: Path, skills: Optional[dict], *, should_copy: bool = Fals
     entries = {}
     for name, source in (skills or {}).items():
         target = root / name
-        source_name = get_skill_name(source)
-        if source_name is None or source_name == name:
+        # Read bytes to preserve every newline and non-name byte in the copied SKILL.md.
+        text = (source / "SKILL.md").read_bytes().decode("utf-8")
+        match = _FRONTMATTER_RE.match(text)
+        if match is None or get_skill_name(source) == name:
             if should_copy:
                 shutil.copytree(source, target)
             else:
                 _link_skill_entry(source, target)
         else:
             target.mkdir(mode = 0o700)
-            # Read bytes to preserve every newline and non-name byte in the copied SKILL.md.
-            text = (source / "SKILL.md").read_bytes().decode("utf-8")
-            start, end = _FRONTMATTER_RE.match(text).span(1)
-            frontmatter = re.sub(
+            start, end = match.span(1)
+            frontmatter, count = re.subn(
                 r"^name[ \t]*:[^\r\n]*", f"name: {name}", text[start:end],
                 count = 1, flags = re.MULTILINE,
             )
+            if count == 0:
+                newline = "\r\n" if text[:start].endswith("\r\n") else "\n"
+                frontmatter = f"name: {name}{newline}{frontmatter}"
             (target / "SKILL.md").write_bytes((text[:start] + frontmatter + text[end:]).encode("utf-8"))
             for sibling in source.iterdir():
                 if sibling.name != "SKILL.md":
@@ -144,7 +173,11 @@ def write_skills_overlay(
         for child in source.iterdir():
             if child.name == ".agent-switch-skills.json" or child.name in skills:
                 continue
-            if child.is_dir() and (child / "SKILL.md").is_file() and get_skill_name(child) in skills:
+            # Like Pi and Codex, a broken user skill only loses its name; it never stops the launch.
+            if (
+                child.is_dir() and (child / "SKILL.md").is_file()
+                and get_skill_name(child, should_fail = False) in skills
+            ):
                 continue
             _link_skill_entry(child, root / child.name)
     return write_skills(root, skills, should_copy = should_copy)

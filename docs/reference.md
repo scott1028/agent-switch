@@ -411,16 +411,18 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
 `--skill` adds one or more skill folders to an agent session, with or without `--url` or
 `--provider`.
 
-- `PATH` is a folder containing `SKILL.md`. Relative paths use the current directory; `~` expands
-  to your home directory. The skill name comes from `NAME:`, then the file's frontmatter `name`,
-  then the folder name. Names must use lowercase letters, digits, and single hyphens, up to 64
-  characters. Repeated names fail.
+- `PATH` is a folder containing `SKILL.md`. `SKILL.md` should start with YAML frontmatter that has
+  a `description`; Codex, Pi, and dsh skip a skill without one. Relative paths use the current
+  directory; `~` expands to your home directory. The skill name comes from `NAME:`, then the file's
+  frontmatter `name`, then the folder name. Names must use lowercase letters, digits, and single
+  hyphens, up to 64 characters. Repeated names fail.
 - Skills cannot be combined with `--as-subagent`. `--skill` is not supported for Codex, Pi,
   dsh-tui, or dst aliases.
-- agent-switch puts injected files in its session folder. Unrenamed skills link to their source,
-  so edits are visible as the agent reads them. If `NAME:` changes an existing frontmatter name,
-  agent-switch copies and updates `SKILL.md`, then links its sibling files; edit the source and
-  restart to refresh that copy. If there is no frontmatter name to change, the skill stays linked.
+- agent-switch puts injected files in its session folder. A skill whose frontmatter `name` already
+  matches links to its source, so edits are visible as the agent reads them. If the frontmatter
+  `name` differs or is missing, agent-switch copies `SKILL.md` with `name: <name>` written in, then
+  links its sibling files; edit the source and restart to refresh that copy. A `SKILL.md` with no
+  frontmatter stays linked.
 - When a Windows agent runs from WSL, injected skill files are copied because the Windows process
   cannot use the WSL links. `--persist` and `--no-launch` reuse their session folder; a later run
   removes the earlier injected files when you omit `--skill`.
@@ -436,12 +438,12 @@ agent-switch dsh --url http://127.0.0.1:8080 --skill /tmp/skills/my-test-skill
 
 | Agent | How the skill is loaded | Which same-name skill wins |
 |---|---|---|
-| Claude Code | `--add-dir=<session>/agent-switch`; the skill is in `.claude/skills/<name>`. | With no clash, the injected skill has the bare name. On a clash, your skill keeps that name and the injected skill is `agent-switch:<name>`. |
+| Claude Code | `--add-dir=<session>/agent-switch`; the skill is in `.claude/skills/<name>`. | With no clash, the injected skill has the bare name. On a clash, your skill keeps that name and the injected skill is `agent-switch:<name>` on Claude Code 2.1.309 or newer; older versions hide the injected skill. |
 | Codex | Native mode sets an overlay `CODEX_HOME` linked to your Codex home. Routed mode uses the session `CODEX_HOME`; `-c skills.config` enables the injected path and disables the same-name entry. | The injected skill wins over same-name skills. |
 | OpenCode | `skills.paths` in the session `OPENCODE_CONFIG`. | The injected skill wins over global skills, `~/.claude/skills`, `~/.agents/skills`, and project `.opencode/skills` on OpenCode 2.0.3. OpenCode 1.x was not verified. |
-| Pi | `<agent dir>/skills`. Native mode sets an overlay `PI_CODING_AGENT_DIR` linked to your Pi home. | The injected skill wins over `~/.pi/agent/skills` and `~/.agents/skills`; project `.pi/skills` and `.agents/skills` win. If a persisted session already has its own unowned `skills` folder, injection stops with an error instead of replacing it. |
-| dsh | A `--patch` row sets `skill-filesystem` `customSkillDirs`. | The injected skill wins over `$DSH_HOME/skills` and `~/.agents/skills`; project `.dsh/skills` and `.agents/skills` win. The session row replaces an explicit `skill-filesystem` config in your profile. |
-| dsh-tui / dst | `preset-patch` rows add the session folder to the `standard`, `ptc`, and `liangshen` presets. The profile must export `./preset-patch`; the gate checks its runtime target, while its error asks for dsh-tui 0.17 or newer. | Same order as dsh. `cordis`, `minimal`, and other unsupported profile presets do not receive injected skills; agent-switch warns when it knows the selected preset. |
+| Pi | `<agent dir>/skills`. Native mode sets an overlay `PI_CODING_AGENT_DIR` linked to your Pi home. | The injected skill wins over `~/.pi/agent/skills` and `~/.agents/skills`; project `.pi/skills` and `.agents/skills` win, as do a same-name skill from a `skills` entry in user or project `settings.json` and pi's own `--skill`. A `!name` pattern in `settings.json` or `--no-skills` hides the injected skill. From `~/.pi/agent/skills`, only top-level skill folders of the same name are hidden; same-name `*.md` files at its root and nested `SKILL.md` folders still load. With native `--skill`, user `settings.json` paths that start with `../` do not resolve. If a persisted session already has its own unowned `skills` folder, injection stops with an error instead of replacing it. |
+| dsh | A `--patch` row sets `skill-filesystem` `customSkillDirs`. | In the `headless` profile, the injected skill wins over `$DSH_HOME/skills` and `~/.agents/skills`; project `.dsh/skills` and `.agents/skills` win. In the `web` profile, a same-name skill the agent preset finds (project, `$DSH_HOME/skills`, `~/.agents/skills`) wins. The session row replaces an explicit `skill-filesystem` config in your profile. |
+| dsh-tui / dst | `preset-patch` rows add the session folder to the `standard`, `ptc`, and `liangshen` presets. The profile must export `./preset-patch`; the gate checks its runtime target, while its error asks for dsh-tui 0.17 or newer. The presets also need dsh 0.1.7 or newer. | Same order as dsh. `cordis`, `minimal`, and other unsupported profile presets do not receive injected skills; agent-switch warns when it knows the selected preset. |
 
 ## Origin and porting from upstream
 

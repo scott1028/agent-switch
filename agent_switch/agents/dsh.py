@@ -368,7 +368,8 @@ def _dsh_model_entry(
 
 def _get_dsh_skill_rows(skills_root: str, *, is_tui: bool) -> list:
     if not is_tui:
-        return [{"id": "skill-filesystem", "config": {"customSkillDirs": [skills_root]}}]
+        # The web profile disables this host row, and a patch row keeps keys it does not list.
+        return [{"id": "skill-filesystem", "disabled": False, "config": {"customSkillDirs": [skills_root]}}]
     return [{"insert": [{
         "id": f"agent-switch-skills-{preset}",
         "name": "@deepseek-harness-tui/dsh-tui/preset-patch",
@@ -460,7 +461,7 @@ def write_dsh_patch(
             {
                 "insert": [
                     {
-                        "id": f"mcp-{name}",
+                        "id": f"agent-switch-mcp-{name}",
                         "name": "@deepseek-ai/dsh-mcp-client",
                         "config": _dsh_mcp_config(name, server),
                     }
@@ -519,7 +520,7 @@ def _write_dsh_mcp_patch(
         entries.append({
             "insert": [
                 {
-                    "id": f"mcp-{name}",
+                    "id": f"agent-switch-mcp-{name}",
                     "name": "@deepseek-ai/dsh-mcp-client",
                     "config": _dsh_mcp_config(name, server),
                 }
@@ -609,8 +610,8 @@ def _check_dsh_tui_start(
     """
     _check_dsh_tui_args(agent, args)
     if compact_at is not None:
-        # dsh-tui disables the host compaction row and its agent presets own compaction with no
-        # threshold seam, so a ratio here would only look applied.
+        # dsh-tui disables the host compaction row; only a per-preset preset-patch row could set a
+        # ratio, and agent-switch writes none.
         _fail(f"--compact-at is not supported for {agent}: its agent presets own compaction.")
     # dsh-tui's own patch pins danger-full-access with approval never on Windows, whatever
     # DSH_PERMISSION_MODE says, because dsh has no Windows sandbox; there is no safe mode to pick.
@@ -787,7 +788,7 @@ def _check_dsh_tui_skills(dsh_home: Path, home: Path, *, is_native: bool) -> Non
             f"Warning: injected skills do not reach dsh-tui preset {preset!r}; "
             "use standard, ptc or liangshen.", err = True,
         )
-    typer.echo("Injected skills reach dsh-tui's standard, ptc and liangshen presets.")
+    typer.echo("Injected skills reach dsh-tui's standard, ptc and liangshen presets on dsh 0.1.7 or newer.")
 
 
 def write_dsh_user_resources(dsh_home: Path, *, is_tui: bool) -> None:

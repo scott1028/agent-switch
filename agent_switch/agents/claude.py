@@ -448,7 +448,7 @@ def _get_claude_skill_flags(config: Path, skills: Optional[dict]) -> list:
         )
     typer.echo(
         f"Injected skills: {', '.join(skills)}. If one shares a name with an existing skill, "
-        "Claude lists it as agent-switch:<name>."
+        "Claude Code 2.1.309 or newer lists it as agent-switch:<name>; older versions hide it."
     )
     return [f"--add-dir={_agent_config_path(directory, ['claude'])}"]
 

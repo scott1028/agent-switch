@@ -118,9 +118,17 @@ def test_subagent_refusal_precedes_source_validation(capsys):
     ("---\nname: 123\n---\n", None),
     ("---\nname: false\n---\n", None),
     ("---\n- name\n---\n", None),
+    ("---\nname: foo\ndescription: Use when: X\n---\n", "foo"),
+    ("\ufeff---\nname: foo\n---\nBody.\n", "foo"),
 ])
 def test_get_skill_name_reads_only_leading_frontmatter(tmp_path, text, name):
     assert skills_core.get_skill_name(_write_skill(tmp_path / "source", text)) == name
+
+
+def test_frontmatter_still_invalid_after_colon_retry_fails(tmp_path, capsys):
+    source = _write_skill(tmp_path / "source", "---\nname: [unclosed\ndescription: Use when: X\n---\n")
+    error = _expect_fail(lambda: skills_core.load_skills([str(source)]), capsys)
+    assert "Could not parse skill frontmatter" in error and str(source) in error
 
 
 @pytest.mark.parametrize("text", ["Body.\n", "---\nname: linked\n---\nBody.\n"])
@@ -173,6 +181,30 @@ def test_rename_changes_only_top_level_name_line_and_links_siblings(tmp_path):
         assert (entry / sibling).resolve() == source / sibling
     if os.name != "nt":
         assert entry.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize(("prefix", "text", "expected"), [
+    ("renamed:", "---\ndescription: Keep.\n---\nBody.\n", "---\nname: renamed\ndescription: Keep.\n---\nBody.\n"),
+    ("renamed:", "---\n---\nBody.\n", "---\nname: renamed\n---\nBody.\n"),
+    ("", "---\r\ndescription: Keep.\r\n---\r\n", "---\r\nname: source\r\ndescription: Keep.\r\n---\r\n"),
+    ("", "---\nname: 123\nnested:\n  name: inner\n---\n", "---\nname: source\nnested:\n  name: inner\n---\n"),
+])
+def test_write_skills_writes_missing_frontmatter_name(tmp_path, prefix, text, expected):
+    source = _write_skill(tmp_path / "source", text)
+    skills = skills_core.load_skills([f"{prefix}{source}"])
+    name = next(iter(skills))
+    entry = skills_core.write_skills(tmp_path / "session", skills)[name]
+    assert not entry.is_symlink()
+    assert (entry / "SKILL.md").read_bytes() == expected.encode("utf-8")
+    assert skills_core.get_skill_name(entry) == name
+
+
+def test_rename_keeps_leading_byte_order_mark(tmp_path):
+    text = "\ufeff---\nname: old-name\n---\nBody.\n"
+    source = _write_skill(tmp_path / "source", text)
+    entry = skills_core.write_skills(tmp_path / "session", {"renamed": source})["renamed"]
+    assert (entry / "SKILL.md").read_bytes() == text.replace("old-name", "renamed").encode("utf-8")
+    assert skills_core.get_skill_name(entry) == "renamed"
 
 
 @pytest.mark.parametrize("cleared", [None, {}])
@@ -292,6 +324,21 @@ def test_skills_overlay_filters_names_and_rebuilds_without_writing_source(tmp_pa
     assert (root / "shared").resolve() == source / "shared"
     assert skills_core.get_skill_name(root / "renamed") == "renamed"
     assert {str(path): path.read_bytes() for path in source.rglob("*") if path.is_file()} == before
+
+
+def test_skills_overlay_links_unparseable_user_skills(tmp_path, capsys):
+    source = tmp_path / "user-skills"
+    invalid_yaml = _write_skill(source / "invalid-yaml", "---\nname: [unclosed\n---\nUSER\n")
+    non_utf8 = source / "non-utf8"
+    non_utf8.mkdir()
+    (non_utf8 / "SKILL.md").write_bytes(b"---\nname: \xff\n---\nUSER\n")
+    injected = _write_skill(tmp_path / "injected")
+    root = tmp_path / "overlay"
+    assert skills_core.write_skills_overlay(root, source, {"injected": injected}) == {"injected": root / "injected"}
+    assert (root / "invalid-yaml").resolve() == invalid_yaml
+    assert (root / "non-utf8").resolve() == non_utf8
+    assert (root / "injected").resolve() == injected
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("has_source", [False, True])

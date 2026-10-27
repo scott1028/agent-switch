@@ -615,16 +615,16 @@ def test_connect_dsh_mcp_inserts_one_row_per_server(fake_vllm, tmp_path, monkeyp
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
-    assert set(rows) == {"mcp-context7", "mcp-github"}
-    assert rows["mcp-context7"]["name"] == "@deepseek-ai/dsh-mcp-client"
-    assert rows["mcp-context7"]["config"] == {
+    assert set(rows) == {"agent-switch-mcp-context7", "agent-switch-mcp-github"}
+    assert rows["agent-switch-mcp-context7"]["name"] == "@deepseek-ai/dsh-mcp-client"
+    assert rows["agent-switch-mcp-context7"]["config"] == {
         "transport": "stdio",
         "serverName": "context7",
         "command": "npx",
         "args": ["-y", "@upstash/context7-mcp"],
         "env": {},
     }
-    assert rows["mcp-github"]["config"] == {
+    assert rows["agent-switch-mcp-github"]["config"] == {
         "transport": "streamable-http",
         "serverName": "github",
         "url": "https://api.githubcopilot.com/mcp/",
@@ -639,7 +639,7 @@ def test_connect_dsh_mcp_all_mounts_every_registry_server(fake_vllm, tmp_path, m
     result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch", "--mcp-all"])
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
-    assert set(rows) == {"mcp-context7", "mcp-github"}
+    assert set(rows) == {"agent-switch-mcp-context7", "agent-switch-mcp-github"}
 
 
 def test_connect_dsh_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
@@ -648,12 +648,28 @@ def test_connect_dsh_mcp_url_mounts_without_a_registry(fake_vllm, tmp_path):
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
-    assert rows["mcp-ev"]["config"] == {
+    assert rows["agent-switch-mcp-ev"]["config"] == {
         "transport": "streamable-http",
         "serverName": "ev",
         "url": "http://127.0.0.1:18331/mcp",
         "headers": {},
     }
+
+
+@pytest.mark.parametrize("is_routed", [True, False])
+def test_dsh_mcp_row_id_does_not_replace_built_in_mcp_resources(fake_vllm, tmp_path, monkeypatch, is_routed):
+    # dsh-base inserts its own top-level `mcp-resources` row; a later row with that id replaces it.
+    if not is_routed:
+        _native_no_connect_dsh(monkeypatch)
+    result = CliRunner().invoke(start.start_app, [
+        "dsh", *(["--url", BASE] if is_routed else []), "--no-launch",
+        "--mcp-url", "resources:http://127.0.0.1:18331/mcp",
+    ])
+    assert result.exit_code == 0, result.output
+    session = tmp_path / "agents" / ("dsh" if is_routed else "dsh-native")
+    rows = _dsh_mcp_rows(session / dsh_agent._DSH_PATCH_FILE)
+    assert list(rows) == ["agent-switch-mcp-resources"]
+    assert rows["agent-switch-mcp-resources"]["config"]["serverName"] == "resources"
 
 
 @pytest.mark.parametrize("routed", [True, False])
@@ -693,7 +709,7 @@ def test_connect_dsh_mcp_stdio_mounts_without_a_registry(fake_vllm, tmp_path):
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
-    assert rows["mcp-ev"]["config"] == {
+    assert rows["agent-switch-mcp-ev"]["config"] == {
         "transport": "stdio",
         "serverName": "ev",
         "command": "npx",
@@ -711,7 +727,7 @@ def test_connect_dsh_mcp_stdio_shell_form(fake_vllm, tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     rows = _dsh_mcp_rows(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
-    assert rows["mcp-ev"]["config"] == {
+    assert rows["agent-switch-mcp-ev"]["config"] == {
         "transport": "stdio",
         "serverName": "ev",
         "command": "bash",
@@ -775,8 +791,8 @@ def test_native_dsh_mcp_patch_holds_only_the_insert_row(fake_vllm, tmp_path, mon
     patch = tmp_path / "agents" / "dsh-native" / "agent-switch.patch.yml"
     assert _launch_command(result.output) == ["dsh", "web", "--patch", str(patch)]
     rows = _dsh_mcp_rows(patch)
-    assert list(rows) == ["mcp-ev"]
-    assert rows["mcp-ev"]["config"]["command"] == "npx"
+    assert list(rows) == ["agent-switch-mcp-ev"]
+    assert rows["agent-switch-mcp-ev"]["config"]["command"] == "npx"
     assert "DSH_HOME" not in result.output
 
 
@@ -855,7 +871,7 @@ def test_native_dsh_skill_patch_is_additive_and_clears(fake_vllm, tmp_path, monk
     ])
     assert result.exit_code == 0, result.output
     rows = yaml.safe_load(patch.read_text())
-    assert {"id": "skill-filesystem", "config": {"customSkillDirs": [str(root)]}} in rows
+    assert {"id": "skill-filesystem", "disabled": False, "config": {"customSkillDirs": [str(root)]}} in rows
     assert len(rows) == 1 + has_mcp
     assert bool(_dsh_mcp_rows(patch)) is has_mcp
     command = _launch_command(baseline.output)
@@ -898,7 +914,10 @@ def test_routed_dsh_skill_patch_preserves_user_skills_and_clears(fake_vllm, tmp_
     ])
     assert result.exit_code == 0, result.output
     rows = yaml.safe_load(patch.read_text())
-    assert rows == [*original_rows, {"id": "skill-filesystem", "config": {"customSkillDirs": [str(root)]}}]
+    assert rows == [
+        *original_rows,
+        {"id": "skill-filesystem", "disabled": False, "config": {"customSkillDirs": [str(root)]}},
+    ]
     assert _launch_command(result.output) == _launch_command(baseline.output)
     assert (session / "skills").resolve() == dsh_home / "skills"
     assert (session / "skills" / "user-only" / "SKILL.md").is_file()
@@ -1047,7 +1066,7 @@ def test_dsh_tui_skills_patch_is_additive_and_clears(fake_vllm, dsh_tui_skill_se
     assert all(row.get("id") != "skill-filesystem" for row in rows)
     assert (root / "shared").resolve() == source
     assert (root / "renamed/SKILL.md").read_text() == "---\nname: renamed\n---\nINJECTED\n"
-    hint = "Injected skills reach dsh-tui's standard, ptc and liangshen presets."
+    hint = "Injected skills reach dsh-tui's standard, ptc and liangshen presets on dsh 0.1.7 or newer."
     assert result.output.splitlines().count(hint) == 1
     assert "DSH_HOME" not in result.output or is_routed
     cleared = CliRunner().invoke(start.start_app, args)
@@ -1119,7 +1138,7 @@ def test_dsh_tui_skills_warn_about_effective_known_preset(fake_vllm, monkeypatch
     assert warnings == ([] if warned is None else [
         f"Warning: injected skills do not reach dsh-tui preset {warned!r}; use standard, ptc or liangshen.",
     ])
-    assert result.output.splitlines().count("Injected skills reach dsh-tui's standard, ptc and liangshen presets.") == 1
+    assert result.output.splitlines().count("Injected skills reach dsh-tui's standard, ptc and liangshen presets on dsh 0.1.7 or newer.") == 1
     assert _get_dsh_skill_snapshot(native.parent) == before
 
 

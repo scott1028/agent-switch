@@ -981,7 +981,7 @@ def test_claude_skill_mounts_session_folder_with_mcp_and_hint(fake_vllm, tmp_pat
     assert (root / "renamed" / "notes.txt").is_symlink()
     assert [line for line in result.output.splitlines() if line.startswith("Injected skills:")] == [
         "Injected skills: shared, renamed. If one shares a name with an existing skill, "
-        "Claude lists it as agent-switch:<name>."
+        "Claude Code 2.1.309 or newer lists it as agent-switch:<name>; older versions hide it."
     ]
     assert "CLAUDE_CONFIG_DIR" not in result.output
 
