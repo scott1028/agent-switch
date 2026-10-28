@@ -59,6 +59,7 @@ from agent_switch.core.options import (
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
     _SKILL_OPTION,
+    _SKILL_SET_OPTION,
     _SUBAGENT_DESCRIPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
@@ -483,6 +484,7 @@ def claude(
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
     skill: Optional[list[str]] = _SKILL_OPTION,
+    skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
 ):
     """Point Claude Code at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -496,7 +498,7 @@ def claude(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
-    skills = load_skills(skill, as_subagent = as_subagent)
+    skills = load_skills(skill, skill_set, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(

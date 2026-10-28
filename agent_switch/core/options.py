@@ -372,6 +372,15 @@ _SKILL_OPTION = typer.Option(
 )
 
 
+_SKILL_SET_OPTION = typer.Option(
+    None,
+    "--skill-set",
+    metavar = "[NS:]PATH|URL",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Add every skill nested in a folder or degit URL; NS: prefixes their names.",
+)
+
+
 _MCP_ENV_OPTION = typer.Option(
     None,
     "--mcp-env",

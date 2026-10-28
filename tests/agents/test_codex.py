@@ -1087,6 +1087,25 @@ def test_native_codex_skill_uses_additive_overlay_and_rules(fake_vllm, tmp_path,
     assert _snapshot_skill_tree(home) == before_home
 
 
+def test_native_codex_skill_set_injects_nested_skills(fake_vllm, tmp_path, monkeypatch, codex_skill_sources):
+    _native_no_connect(monkeypatch)
+    set_root = tmp_path / "set"
+    alpha = set_root / "group" / "alpha"
+    alpha.mkdir(parents = True)
+    (alpha / "SKILL.md").write_text("Nested.\n")
+    result = CliRunner().invoke(
+        start.start_app,
+        ["codex", "--no-launch", "--skill-set", str(set_root), "--", "exec", "hello"],
+    )
+    assert result.exit_code == 0, result.output
+    overlay = tmp_path / "agents" / "codex-native" / "home"
+    assert (overlay / "skills" / "alpha").resolve() == alpha
+    assert _parse_toml(_launch_command(result.output)[2])["skills"]["config"] == [
+        {"name": "alpha", "enabled": False},
+        {"path": str(overlay / "skills" / "alpha" / "SKILL.md"), "enabled": True},
+    ]
+
+
 def test_native_codex_without_skill_keeps_existing_home_and_command(fake_vllm, tmp_path, monkeypatch, codex_skill_sources):
     _native_no_connect(monkeypatch)
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--", "exec", "hello"])

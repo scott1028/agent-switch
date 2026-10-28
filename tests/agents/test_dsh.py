@@ -895,6 +895,22 @@ def test_native_dsh_skill_patch_is_additive_and_clears(fake_vllm, tmp_path, monk
     assert not patch.exists()
 
 
+def test_native_dsh_skill_set_injects_nested_skills(fake_vllm, tmp_path, monkeypatch, dsh_skill_sources):
+    yaml = pytest.importorskip("yaml")
+    _native_no_connect_dsh(monkeypatch)
+    set_root = tmp_path / "set"
+    alpha = set_root / "group" / "alpha"
+    alpha.mkdir(parents = True)
+    (alpha / "SKILL.md").write_text("Nested.\n")
+    result = CliRunner().invoke(start.start_app, ["dsh", "--no-launch", "--skill-set", str(set_root)])
+    assert result.exit_code == 0, result.output
+    session = tmp_path / "agents" / "dsh-native"
+    root = session / "skills-injected"
+    assert (root / "alpha").is_symlink() and (root / "alpha").resolve() == alpha
+    rows = yaml.safe_load((session / dsh_agent._DSH_PATCH_FILE).read_text())
+    assert {"id": "skill-filesystem", "disabled": False, "config": {"customSkillDirs": [str(root)]}} in rows
+
+
 @pytest.mark.parametrize("should_persist", [False, True])
 @pytest.mark.parametrize("profile", ["web", "headless"])
 def test_routed_dsh_skill_patch_preserves_user_skills_and_clears(fake_vllm, tmp_path, dsh_skill_sources, should_persist, profile):
@@ -929,6 +945,23 @@ def test_routed_dsh_skill_patch_preserves_user_skills_and_clears(fake_vllm, tmp_
     assert not (root / "shared").exists() and not (root / "renamed").exists()
     assert (session / "skills").resolve() == dsh_home / "skills"
     assert json.loads((root / ".agent-switch-skills.json").read_text()) == {"entries": []}
+
+
+def test_routed_dsh_skill_set_injects_nested_skills(fake_vllm, tmp_path, dsh_skill_sources):
+    yaml = pytest.importorskip("yaml")
+    set_root = tmp_path / "set"
+    alpha = set_root / "group" / "alpha"
+    alpha.mkdir(parents = True)
+    (alpha / "SKILL.md").write_text("Nested.\n")
+    result = CliRunner().invoke(start.start_app, [
+        "dsh", "--url", BASE, "--no-launch", "--skill-set", str(set_root),
+    ])
+    assert result.exit_code == 0, result.output
+    session = tmp_path / "agents" / "dsh"
+    root = session / "skills-injected"
+    assert (root / "alpha").is_symlink() and (root / "alpha").resolve() == alpha
+    rows = yaml.safe_load((session / dsh_agent._DSH_PATCH_FILE).read_text())
+    assert {"id": "skill-filesystem", "disabled": False, "config": {"customSkillDirs": [str(root)]}} in rows
 
 
 def test_dsh_skill_persisted_launch_clears_row_and_entries(fake_vllm, tmp_path, monkeypatch, dsh_skill_sources):
@@ -1100,7 +1133,7 @@ def test_dsh_tui_skills_gate_requires_profile_export_and_target(fake_vllm, dsh_t
     if failure == "missing":
         assert "start dsh-tui once without --skill" in result.output
     else:
-        assert "--skill needs dsh-tui 0.17 or newer" in result.output
+        assert "--skill/--skill-set needs dsh-tui 0.17 or newer" in result.output
         assert f"found {'0.14.0' if failure == 'no-export' else '0.17.0'}" in result.output
         if is_routed:
             assert "DSH_HOME=" in result.output and "dsh-tui update`." in result.output
@@ -1150,7 +1183,19 @@ def test_dsh_tui_alias_refuses_skills_before_alias_probe(fake_vllm, monkeypatch,
         "dsh-tui-personal", *(["--url", BASE] if is_routed else []), "--no-launch", "--skill", str(source),
     ])
     assert result.exit_code == 1
-    assert "--skill is not supported for dsh-tui aliases" in result.output
+    assert "--skill and --skill-set are not supported for dsh-tui aliases" in result.output
+    assert "own DSH_HOME and HOME" in result.output
+    assert fake_vllm == []
+
+
+def test_dsh_tui_alias_refuses_skill_set_before_alias_probe(fake_vllm, monkeypatch, dsh_tui_skill_session):
+    _, source, _ = dsh_tui_skill_session
+    set_start_attr(monkeypatch, "_check_alias", lambda *_: pytest.fail("alias must be refused first"))
+    result = CliRunner().invoke(start.start_app, [
+        "dsh-tui-personal", "--no-launch", "--skill-set", str(source),
+    ])
+    assert result.exit_code == 1
+    assert "--skill and --skill-set are not supported for dsh-tui aliases" in result.output
     assert "own DSH_HOME and HOME" in result.output
     assert fake_vllm == []
 

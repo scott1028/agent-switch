@@ -138,13 +138,18 @@ for that session. [Registry format, authentication, and examples](docs/reference
 agent-switch claude --skill /tmp/skills/my-test-skill
 agent-switch codex --skill skill1:/tmp/skills/my-test-skill --skill /tmp/skills/my-test-skill2
 agent-switch claude --skill https://github.com/user/repo/tree/main/skills/my-skill
+agent-switch claude --skill-set https://github.com/gamedev-skills/awesome-gamedev-agent-skills/tree/main/skills/godot
 ```
 
 - `--skill` works with or without `--url` or `--provider`.
-- Add `NAME:` before a path to give that skill a different name.
+- `--skill-set` adds every skill folder nested in a folder or URL, at any depth.
+- Add `NS:` before a `--skill-set` path to name all of its skills `NS-<name>`.
+- Add `NAME:` before a `--skill` path to give that skill a different name.
 - A URL is downloaded with `degit` (degit 3 or newer; install it first with
   `npm install -g degit`) and reused on later runs; delete the folder it prints on a later
   run to download it again.
+- When injected skills share a name, the later one wins: the `--skill-set` values in flag
+  order first, then the `--skill` values ([name order](docs/reference.md#session-skills)).
 - An injected skill wins a same-name clash, with the agent-specific exceptions in the reference.
 - Edits show up live. If renaming rewrites `SKILL.md`, edit the source and restart to refresh the copy.
 

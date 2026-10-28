@@ -418,7 +418,12 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   a `description`; Codex, Pi, and dsh skip a skill without one. Relative paths use the current
   directory; `~` expands to your home directory. The skill name comes from `NAME:`, then the file's
   frontmatter `name`, then the folder name. Names must use lowercase letters, digits, and single
-  hyphens, up to 64 characters. Repeated names fail.
+  hyphens, up to 64 characters. When injected skills share a name, the later one wins and replaces
+  the earlier one whole: first the `--skill-set` values in flag order, then the `--skill` values
+  in flag order, and inside one set the later path in the sorted walk. Each dropped name prints
+  one line on stderr naming the winner and the dropped folders, and a folder counted twice is
+  not a drop. The winner then competes with the
+  agent's own skills as the table below shows.
 - `PATH` can also be a URL that starts with a scheme such as `https://`, and `NAME:URL` works
   too. agent-switch downloads it with [degit](https://github.com/Rich-Harris/degit) into
   `<temp dir>/agent-switch-skills-<uid>/<hash>/<leaf>`: on Linux the temp dir is `$TMPDIR`,
@@ -435,8 +440,28 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   read your environment variables, so use only URLs you trust. Short forms such as
   `user/repo` or `github:user/repo` are read as a local path or as `NAME:`, so use the full
   URL.
-- Skills cannot be combined with `--as-subagent`. `--skill` is not supported for Codex, Pi,
-  dsh-tui, or dst aliases.
+- `--skill-set [NS:]PATH|URL` adds every skill nested in a folder. Each folder holding `SKILL.md`
+  is one skill, at any depth, and its inside is not searched further, so a `SKILL.md` under
+  a skill's `references/` stays part of that skill. A set whose root folder holds `SKILL.md`
+  itself, or that holds no skill at all, fails: use `--skill` for a single skill. Local
+  skills are used where they are, not copied, and a local set follows folder links wherever
+  they point, so a skill folder linked into the set counts, and a link to a parent folder
+  is searched too. One unreadable folder inside a set stops the whole set. A URL is
+  downloaded with degit and flattened
+  into `<temp dir>/agent-switch-skills-<uid>/<hash>/<leaf>`, one folder per skill, and the
+  set root's other files, such as `README.md`, are dropped. That cache is reused on later
+  runs like `--skill`, and the same URL keeps a separate cache for each flag. Flattening
+  names each cache folder after the skill, frontmatter `name` first and folder name when
+  there is none, and dedupes by that name in source-path order: the later skill of a
+  shared name replaces the earlier one, and the cache holds only the winners. That drop
+  prints the stderr notice described above, but only on the first download of the URL;
+  a cached run knows nothing about it. Each set skill is named like `--skill`, first by
+  frontmatter `name`, then by folder name; an `NS:` prefix, parsed like `NAME:`, names
+  all of them `NS-<name>`, and the result must pass the name check. A one-letter NS
+  before an absolute path, like `g:/x`, reads as a Windows drive, so use a longer
+  namespace. Shared names follow the last-wins order above.
+- Skills cannot be combined with `--as-subagent`. `--skill` and `--skill-set` are not
+  supported for Codex, Pi, dsh-tui, or dst aliases.
 - agent-switch puts injected files in its session folder. A skill whose frontmatter `name` already
   matches links to its source, so edits are visible as the agent reads them. If the frontmatter
   `name` differs or is missing, agent-switch copies `SKILL.md` with `name: <name>` written in, then
@@ -444,7 +469,7 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   frontmatter stays linked.
 - When a Windows agent runs from WSL, injected skill files are copied because the Windows process
   cannot use the WSL links. `--persist` and `--no-launch` reuse their session folder; a later run
-  removes the earlier injected files when you omit `--skill`.
+  removes the earlier injected files when you omit `--skill` and `--skill-set`.
 - agent-switch does not install skills into your persistent agent skill list or edit the source
   folder. Codex and Pi native overlays link some of your real config files, so changes those agents
   save through those links can still reach your normal config.

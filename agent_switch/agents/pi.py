@@ -56,6 +56,7 @@ from agent_switch.core.options import (
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
     _SKILL_OPTION,
+    _SKILL_SET_OPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
     _TOP_P_OPTION,
@@ -592,6 +593,7 @@ def pi(
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
     skill: Optional[list[str]] = _SKILL_OPTION,
+    skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
 ):
     """Point Pi (coding agent) at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -605,7 +607,7 @@ def pi(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
-    skills = load_skills(skill, as_subagent = as_subagent)
+    skills = load_skills(skill, skill_set, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(
@@ -632,8 +634,8 @@ def pi(
         _fail("--as-subagent is not supported for agent aliases.")
     if alias and skills:
         _fail(
-            "--skill is not supported for pi aliases: the alias sets its own PI_CODING_AGENT_DIR; "
-            "use `agent-switch pi`."
+            "--skill and --skill-set are not supported for pi aliases: the alias sets "
+            "its own PI_CODING_AGENT_DIR; use `agent-switch pi`."
         )
     if alias and target is not None:
         # The function sets its own PI_CODING_AGENT_DIR, which outranks the session env, so the

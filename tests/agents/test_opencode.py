@@ -1700,6 +1700,20 @@ def test_native_opencode_skill_config_mounts_and_clears(fake_vllm, tmp_path, mon
     assert not (cfg / "skills" / "renamed").exists()
 
 
+def test_native_opencode_skill_set_injects_nested_skills(fake_vllm, tmp_path, monkeypatch, opencode_skill_sources):
+    _native_no_connect(monkeypatch)
+    set_start_attr(monkeypatch, "_opencode_command", lambda *_: ("opencode", False))
+    set_root = tmp_path / "set"
+    alpha = set_root / "group" / "alpha"
+    alpha.mkdir(parents = True)
+    (alpha / "SKILL.md").write_text("Nested.\n")
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "--skill-set", str(set_root)])
+    assert result.exit_code == 0, result.output
+    cfg = tmp_path / "agents" / "opencode-native"
+    assert (cfg / "skills" / "alpha").is_symlink()
+    assert (cfg / "skills" / "alpha").resolve() == alpha
+
+
 @pytest.mark.parametrize("is_v2", [False, True])
 @pytest.mark.parametrize("should_persist", [False, True])
 def test_routed_opencode_skills_clear_on_rerun(fake_vllm, tmp_path, monkeypatch, opencode_skill_sources, is_v2, should_persist):

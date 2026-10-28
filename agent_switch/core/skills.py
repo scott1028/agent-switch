@@ -71,8 +71,37 @@ def get_skill_name(skill_dir: Path, *, should_fail: bool = True) -> Optional[str
     return name if isinstance(name, str) else None
 
 
-def _download_skill(url: str) -> Path:
+def _find_skill_dirs(root: Path, *, should_follow_links: bool = False) -> list:
+    """List folders holding SKILL.md top-down, so nothing nested inside a skill counts."""
+    # os.path.isdir answers False for any OSError, so an unreadable parent keeps the set's message.
+    if not os.path.isdir(root):
+        return []
+    folders = []
+    seen = set()
+    # An unreadable folder hides skills, so a partial scan must stop with its path named.
+    for current, dirnames, filenames in os.walk(
+        root,
+        onerror = lambda exc: _fail(f"Cannot search skill folder {exc.filename}; "
+                                    "fix its permissions, or pass a narrower folder."),
+        followlinks = should_follow_links,
+    ):
+        # A followed link can reach a folder that was already walked, so skip any repeat real path.
+        real = os.path.realpath(current)
+        if real in seen:
+            dirnames.clear()
+            continue
+        seen.add(real)
+        dirnames.sort()
+        if "SKILL.md" in filenames:
+            folders.append(Path(current))
+            dirnames.clear()
+    return folders
+
+
+def _download_skill(url: str, *, is_skill_set: bool = False) -> Path:
     """Fetch a degit URL into a private per-user temp cache, reusing a folder downloaded earlier."""
+    label = "skill set" if is_skill_set else "skill"
+    flag = "--skill-set" if is_skill_set else "--skill"
     leaf = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
     if leaf.endswith(".git"):
         leaf = leaf[:-4]
@@ -100,13 +129,15 @@ def _download_skill(url: str) -> Path:
             f"Cannot use skill cache {root}: it must be a private folder you own. "
             "Remove it, or set TMPDIR to a private folder, then re-run."
         )
-    target = root / hashlib.sha256(url.encode("utf-8")).hexdigest()[:12] / leaf
+    # A skill set hashes under its own key so one URL never shares a cache between the flags.
+    cache_key = f"skill-set:{url}" if is_skill_set else url
+    target = root / hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:12] / leaf
     if target.is_dir():
-        typer.echo(f"Using cached skill {url} from {target}; delete that folder to download it again.")
+        typer.echo(f"Using cached {label} {url} from {target}; delete that folder to download it again.")
         return target
     degit = _which_with_install_dirs("degit")
     if degit is None:
-        _fail(f"--skill {url} needs degit. Install it with `npm install -g degit`, then re-run.")
+        _fail(f"{flag} {url} needs degit. Install it with `npm install -g degit`, then re-run.")
     target.parent.mkdir(mode = 0o700, exist_ok = True)
     # Download into a fresh empty folder, then rename, so a failed run never looks like a cache.
     partial = Path(tempfile.mkdtemp(dir = target.parent))
@@ -117,7 +148,66 @@ def _download_skill(url: str) -> Path:
         subprocess.run(_resolved_launch_command(degit, [url, str(partial)], env), env = env, check = True)
     except (OSError, subprocess.CalledProcessError):
         shutil.rmtree(partial, ignore_errors = True)
-        _fail(f"degit could not download skill {url}.")
+        _fail(f"degit could not download {label} {url}.")
+    if is_skill_set:
+        flat = None
+        try:
+            folders = _find_skill_dirs(partial)
+            if not folders or folders[0] == partial:
+                _fail(
+                    f"degit downloaded {url}, but it holds no nested skill folder. "
+                    "Use --skill for a single skill."
+                )
+            # Flatten every skill folder to one level, so the cache holds only skills and drops
+            # the set root's extra files, like README.md.
+            flat = Path(tempfile.mkdtemp(dir = target.parent))
+            dropped = {}
+            landed = {}
+            base = url.rstrip("/")
+            for folder in folders:
+                # Name the download content by its URL path, since the temp folder is deleted.
+                source = f"{base}/{folder.relative_to(partial).as_posix()}"
+                # Degit can land a broken SKILL.md symlink, so check it like load_skills does.
+                if not (folder / "SKILL.md").is_file():
+                    _fail(f"Skill path {source} must be a directory holding SKILL.md.")
+                # An unreadable SKILL.md must name itself, not the publish step that follows.
+                try:
+                    name = get_skill_name(folder)
+                except OSError:
+                    _fail(f"Cannot read {source}/SKILL.md.")
+                # Land each skill under the name load_skills will give, so source order decides.
+                if name is None:
+                    name = folder.name
+                if len(name) > 64 or _SKILL_NAME_RE.fullmatch(name) is None:
+                    _fail(
+                        f"Invalid skill name {name!r}: use lowercase letters, digits and "
+                        "single hyphens, with at most 64 characters. Rename it upstream."
+                    )
+                key = name.casefold()
+                if key in landed:
+                    # The later skill of the same name wins: the sorted source-path walk decides.
+                    shutil.rmtree(flat / landed[key][0], ignore_errors = True)
+                    dropped.setdefault(name, []).append(landed[key][1])
+                landed[key] = (name, folder.relative_to(partial))
+                folder.replace(flat / name)
+            flat.replace(target)
+            # The first download is the only run that knows these drops; cache runs show nothing.
+            for name, losers in dropped.items():
+                losers_text = ", ".join(f"{base}/{loser.as_posix()}" for loser in reversed(losers))
+                typer.echo(
+                    f"agent-switch: skill set {url}: skill {name} uses {target / name}; "
+                    f"dropped {losers_text}.",
+                    err = True,
+                )
+        except OSError:
+            # A concurrent run may have published the same URL first; its cache wins.
+            if not target.is_dir():
+                _fail(f"Cannot publish the downloaded skill set {url} under {target}.")
+        finally:
+            for tree in (partial, flat):
+                if tree is not None:
+                    shutil.rmtree(tree, ignore_errors = True)
+        return target
     if not (partial / "SKILL.md").is_file():
         shutil.rmtree(partial, ignore_errors = True)
         _fail(f"degit downloaded {url}, but the folder has no SKILL.md.")
@@ -125,14 +215,47 @@ def _download_skill(url: str) -> Path:
     return target
 
 
-def load_skills(values: Optional[list], *, as_subagent: bool = False) -> Optional[dict]:
-    """Resolve repeated [NAME:]PATH|URL values into ordered names and absolute source folders."""
-    if not values:
+def load_skills(
+    values: Optional[list], skill_sets: Optional[list] = None, *, as_subagent: bool = False,
+) -> Optional[dict]:
+    """Resolve [NAME:]PATH|URL skills and [NS:]PATH|URL skill sets; the later skill wins a name."""
+    if not values and not skill_sets:
         return None
     if as_subagent:
-        _fail("--skill cannot be combined with --as-subagent.")
-    skills = {}
-    for value in values:
+        flag = "--skill" if values else "--skill-set"
+        _fail(f"{flag} cannot be combined with --as-subagent.")
+    sources = []
+    # Sets come first, in flag order, so a later set beats an earlier one and every --skill
+    # beats them all. Inside one set the sorted walk order decides.
+    for value in skill_sets or []:
+        if _URL_SCHEME_RE.match(value):
+            # A bare URL is the whole path; only NS:URL carries a namespace.
+            namespace, path = None, value
+        else:
+            namespace, path = _parse_name_value(value)
+        if not path:
+            # A bare NS: or an unset shell variable must never search the current folder.
+            if namespace is not None:
+                _fail(f"--skill-set {value!r} needs a folder or URL after the namespace.")
+            _fail(f"--skill-set {value!r} needs a folder or URL.")
+        if namespace is not None and (
+            len(namespace) > 62 or _SKILL_NAME_RE.fullmatch(namespace) is None
+        ):
+            _fail(
+                f"Invalid --skill-set namespace {namespace!r}: use lowercase letters, "
+                "digits and single hyphens."
+            )
+        if _URL_SCHEME_RE.match(path):
+            root = _download_skill(path, is_skill_set = True)
+            folders = _find_skill_dirs(root)
+        else:
+            root = Path(os.path.abspath(os.path.expanduser(path)))
+            # A local set is used where it is, so follow folder links into skills elsewhere.
+            folders = _find_skill_dirs(root, should_follow_links = True)
+        if not folders or folders[0] == root:
+            _fail(f"Skill set {root} must be a folder holding nested skills; use --skill for a single skill.")
+        sources.extend((namespace, folder, True) for folder in folders)
+    for value in values or []:
         if _URL_SCHEME_RE.match(value):
             # A bare URL is the whole path; only NAME:URL carries a name.
             given_name, path = None, value
@@ -142,22 +265,45 @@ def load_skills(values: Optional[list], *, as_subagent: bool = False) -> Optiona
             source = _download_skill(path)
         else:
             source = Path(os.path.abspath(os.path.expanduser(path)))
+        sources.append((given_name, source, False))
+    skills = {}
+    dropped = {}
+    for given_name, source, from_set in sources:
         if not source.is_dir() or not (source / "SKILL.md").is_file():
             _fail(f"Skill path {source} must be a directory holding SKILL.md.")
-        name = given_name
+        name = given_name if not from_set else None
         if name is None:
             name = get_skill_name(source)
-        if name is None:
-            name = source.name
+            if name is None:
+                name = source.name
+        # A set skill keeps its own name; an NS: prefix lands in front of it.
+        if from_set and given_name is not None:
+            name = f"{given_name}-{name}"
         if len(name) > 64 or _SKILL_NAME_RE.fullmatch(name) is None:
-            hint = " Use NAME:PATH to give it a valid name." if given_name is None else ""
+            if from_set:
+                # The set keeps failing while it holds the skill, so only an upstream rename helps.
+                hint = " Rename it upstream."
+            else:
+                hint = " Use NAME:PATH to give it a valid name." if given_name is None else ""
             _fail(
                 f"Invalid skill name {name!r}: use lowercase letters, digits and single hyphens, "
                 f"with at most 64 characters.{hint}"
             )
         if name in skills:
-            _fail(f"Two injected skills are both named {name!r}; give each a distinct NAME: prefix.")
+            # The later skill replaces the earlier one whole, never a mix of the two folders.
+            dropped.setdefault(name, []).append(skills[name])
         skills[name] = source
+    for name, losers in dropped.items():
+        winner = os.path.realpath(skills[name])
+        # A folder passed twice, or by overlapping sets, is not a real drop.
+        losers = [loser for loser in losers if os.path.realpath(loser) != winner]
+        if not losers:
+            continue
+        typer.echo(
+            f"agent-switch: skill {name} uses {skills[name]}; "
+            f"dropped {', '.join(str(loser) for loser in reversed(losers))}.",
+            err = True,
+        )
     return skills
 
 

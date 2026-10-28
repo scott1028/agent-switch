@@ -60,6 +60,7 @@ from agent_switch.core.options import (
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
     _SKILL_OPTION,
+    _SKILL_SET_OPTION,
     _SUBAGENT_DESCRIPTION,
     _SUBAGENT_INSTRUCTIONS,
     _TEMPERATURE_OPTION,
@@ -677,6 +678,7 @@ def opencode(
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
     skill: Optional[list[str]] = _SKILL_OPTION,
+    skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
 ):
     """Point OpenCode at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -690,7 +692,7 @@ def opencode(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
-    skills = load_skills(skill, as_subagent = as_subagent)
+    skills = load_skills(skill, skill_set, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(

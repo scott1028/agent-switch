@@ -64,6 +64,7 @@ from agent_switch.core.options import (
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
     _SKILL_OPTION,
+    _SKILL_SET_OPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
     _TOP_P_OPTION,
@@ -762,8 +763,8 @@ def _check_dsh_tui_skills(dsh_home: Path, home: Path, *, is_native: bool) -> Non
     manifest = package / "package.json"
     if not manifest.is_file():
         _fail(
-            f"--skill needs the dsh-tui profile in {profile}; start dsh-tui once without "
-            "--skill to install it, then retry."
+            f"--skill/--skill-set needs the dsh-tui profile in {profile}; start dsh-tui once "
+            "without --skill/--skill-set to install it, then retry."
         )
     metadata = _read_json_object(manifest) or {}
     exports = metadata.get("exports")
@@ -776,7 +777,7 @@ def _check_dsh_tui_skills(dsh_home: Path, home: Path, *, is_native: bool) -> Non
             env = {**_get_dsh_tui_env(home), "DSH_HOME": str(dsh_home)}
             update = " ".join([*(f"{name}={shlex.quote(value)}" for name, value in env.items()), update])
         _fail(
-            f"--skill needs dsh-tui 0.17 or newer in {profile} "
+            f"--skill/--skill-set needs dsh-tui 0.17 or newer in {profile} "
             f"(found {metadata.get('version', 'unknown')}); run `{update}`."
         )
     preset = (os.environ.get("DSH_TUI_PRESET") or "").strip() if is_native else None
@@ -866,6 +867,7 @@ def dsh(
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
     skill: Optional[list[str]] = _SKILL_OPTION,
+    skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
 ):
     """Point DeepSeek Harness (dsh) at a local model server and start it."""
     # One handler for dsh and the TUI: they share the server route and differ in launch and home.
@@ -874,10 +876,10 @@ def dsh(
     # For an alias like dsh-tui-x, info_name is the alias itself; the group names the kind.
     kind = ctx.meta.get(_ALIAS_KIND_META) or agent
     is_tui = kind != "dsh"
-    if is_tui and alias and skill:
+    if is_tui and alias and (skill or skill_set):
         _fail(
-            f"--skill is not supported for {kind} aliases: the alias sets its own DSH_HOME "
-            f"and HOME; use `agent-switch {kind}`."
+            f"--skill and --skill-set are not supported for {kind} aliases: the alias sets "
+            f"its own DSH_HOME and HOME; use `agent-switch {kind}`."
         )
     raw_persist = persist
     # dsh-tui/dst keep their session home unless --no-persist; dsh stays throwaway unless --persist.
@@ -938,7 +940,7 @@ def dsh(
             stdios = mcp_stdio,
             envs = mcp_env,
         )
-        skills = load_skills(skill)
+        skills = load_skills(skill, skill_set)
         _check_dsh_mcp_names(mcp_servers)
         with _session_config(f"{_DSH_TUI_AGENT if is_tui else 'dsh'}-native", launch) as home:
             if is_tui and skills:
@@ -1009,7 +1011,7 @@ def dsh(
         stdios = mcp_stdio,
         envs = mcp_env,
     )
-    skills = load_skills(skill)
+    skills = load_skills(skill, skill_set)
     _check_dsh_mcp_names(mcp_servers)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     install_hint = _npm_install_hint(_DSH_TUI_PACKAGE if is_tui else _DSH_PACKAGE)

@@ -986,6 +986,22 @@ def test_claude_skill_mounts_session_folder_with_mcp_and_hint(fake_vllm, tmp_pat
     assert "CLAUDE_CONFIG_DIR" not in result.output
 
 
+def test_claude_skill_set_injects_nested_skills(fake_vllm, tmp_path, claude_skill_sources):
+    set_root = tmp_path / "set"
+    alpha = set_root / "group" / "alpha"
+    alpha.mkdir(parents = True)
+    (alpha / "SKILL.md").write_text("---\nname: nested-alpha\n---\nNested.\n")
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--skill-set", str(set_root), "--", "--print", "hello"],
+    )
+    assert result.exit_code == 0, result.output
+    root = tmp_path / "agents" / "claude-native" / "agent-switch" / ".claude" / "skills"
+    assert (root / "nested-alpha").is_symlink()
+    assert (root / "nested-alpha").resolve() == alpha
+    assert any(line.startswith("Injected skills: nested-alpha.") for line in result.output.splitlines())
+
+
 @pytest.mark.parametrize(("is_routed", "should_persist"), [(False, False), (True, False), (True, True)])
 def test_claude_skill_rerun_clears_entries_and_restores_command_and_env(fake_vllm, tmp_path, claude_skill_sources, is_routed, should_persist):
     _, source = claude_skill_sources

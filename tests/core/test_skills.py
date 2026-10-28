@@ -32,6 +32,7 @@ def _expect_fail(call, capsys):
 def test_no_values_load_nothing(values):
     assert skills_core.load_skills(values) is None
     assert skills_core.load_skills(values, as_subagent = True) is None
+    assert skills_core.load_skills(values, values) is None
 
 
 def test_plain_and_named_paths_keep_flag_order(tmp_path):
@@ -58,7 +59,9 @@ def test_home_and_relative_paths_are_absolute(tmp_path, monkeypatch):
 _PROBE_ENV_SENTINEL = {"PATH": "probe-env"}
 
 
-def _fake_degit(monkeypatch, tmp_path, *, degit = "/usr/bin/degit", returncode = 0, skill_md = True):
+def _fake_degit(
+    monkeypatch, tmp_path, *, degit = "/usr/bin/degit", returncode = 0, skill_md = True, files = None,
+):
     calls = []
 
     def fake_run(command, *args, **kwargs):
@@ -71,6 +74,10 @@ def _fake_degit(monkeypatch, tmp_path, *, degit = "/usr/bin/degit", returncode =
             (destination / "SKILL.md").write_text("Skill body.\n")
         else:
             (destination / "README.md").write_text("No skill here.\n")
+        for name, text in (files or {}).items():
+            path = destination / name
+            path.parent.mkdir(parents = True, exist_ok = True)
+            path.write_text(text)
         if returncode and kwargs.get("check"):
             raise subprocess.CalledProcessError(returncode, command)
         return subprocess.CompletedProcess(command, returncode)
@@ -89,6 +96,11 @@ def _cache_root(tmp_path):
 
 def _cached_target(tmp_path, url, leaf):
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    return _cache_root(tmp_path) / digest / leaf
+
+
+def _cached_set_target(tmp_path, url, leaf):
+    digest = hashlib.sha256(f"skill-set:{url}".encode("utf-8")).hexdigest()[:12]
     return _cache_root(tmp_path) / digest / leaf
 
 
@@ -280,11 +292,14 @@ def test_name_can_be_64_characters(tmp_path):
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_duplicate_names_fail(tmp_path, capsys, explicit):
+def test_duplicate_names_last_wins(tmp_path, capsys, explicit):
     sources = [_write_skill(tmp_path / folder, "---\nname: repeated\n---\n")
                for folder in ["first", "second"]]
     values = [f"repeated:{source}" if explicit else str(source) for source in sources]
-    assert "repeated" in _expect_fail(lambda: skills_core.load_skills(values), capsys)
+    assert skills_core.load_skills(values) == {"repeated": sources[1]}
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill repeated uses {sources[1]}; dropped {sources[0]}."
+    ]
 
 
 def test_subagent_refusal_precedes_source_validation(capsys):
@@ -292,6 +307,527 @@ def test_subagent_refusal_precedes_source_validation(capsys):
         lambda: skills_core.load_skills(["missing"], as_subagent = True), capsys
     )
     assert "--skill cannot be combined with --as-subagent." in error
+
+
+def test_subagent_refusal_names_skill_set_flag(capsys):
+    error = _expect_fail(
+        lambda: skills_core.load_skills(None, ["missing"], as_subagent = True), capsys
+    )
+    assert "--skill-set cannot be combined with --as-subagent." in error
+
+
+def test_local_skill_set_finds_every_nested_skill(tmp_path):
+    root = tmp_path / "set"
+    alpha = _write_skill(root / "alpha")
+    (alpha / "references").mkdir()
+    (alpha / "references" / "SKILL.md").write_text("Part of the skill.\n")
+    beta = _write_skill(root / "group" / "beta", "---\nname: beta-name\n---\nBody.\n")
+    skills = skills_core.load_skills(None, [str(root)])
+    assert list(skills.items()) == [("alpha", alpha), ("beta-name", beta)]
+
+
+def test_local_skill_set_follows_relative_and_absolute_symlinked_folders(tmp_path):
+    _write_skill(tmp_path / "skills" / "alpha", "---\nname: linked-alpha\n---\nBody.\n")
+    beta = _write_skill(tmp_path / "elsewhere" / "beta")
+    root = tmp_path / "set"
+    root.mkdir()
+    (root / "alpha-link").symlink_to("../skills/alpha", target_is_directory = True)
+    (root / "beta-link").symlink_to(beta, target_is_directory = True)
+    skills = skills_core.load_skills(None, [str(root)])
+    assert list(skills.items()) == [
+        ("linked-alpha", root / "alpha-link"), ("beta-link", root / "beta-link")
+    ]
+
+
+def test_local_skill_set_symlink_loop_finds_each_skill_once(tmp_path):
+    root = tmp_path / "set"
+    alpha = _write_skill(root / "alpha")
+    zeta = _write_skill(root / "zeta")
+    (root / "loop").symlink_to(root, target_is_directory = True)
+    skills = skills_core.load_skills(None, [str(root)])
+    assert list(skills.items()) == [("alpha", alpha), ("zeta", zeta)]
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason = "POSIX folder modes")
+def test_local_skill_set_unreadable_folder_fails(tmp_path, capsys):
+    root = tmp_path / "set"
+    _write_skill(root / "alpha")
+    group = root / "group"
+    _write_skill(group / "beta")
+    group.chmod(0o000)
+    try:
+        error = _expect_fail(lambda: skills_core.load_skills(None, [str(root)]), capsys)
+    finally:
+        group.chmod(0o700)
+    assert str(group) in error
+    assert "fix its permissions, or pass a narrower folder." in error
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason = "POSIX folder modes")
+def test_local_skill_set_unreadable_parent_gives_the_normal_message(tmp_path, capsys):
+    locked = tmp_path / "locked"
+    root = locked / "set"
+    _write_skill(root / "alpha")
+    locked.chmod(0o000)
+    try:
+        error = _expect_fail(lambda: skills_core.load_skills(None, [str(root)]), capsys)
+    finally:
+        locked.chmod(0o700)
+    assert "must be a folder holding nested skills" in error
+    assert "Traceback" not in error
+
+
+@pytest.mark.parametrize("kind", ["root-skill", "empty", "missing"])
+def test_local_skill_set_without_nested_skills_fails(tmp_path, capsys, kind):
+    if kind == "root-skill":
+        root = _write_skill(tmp_path / "set")
+    elif kind == "empty":
+        root = tmp_path / "set"
+        root.mkdir()
+    else:
+        root = tmp_path / "missing"
+    error = _expect_fail(lambda: skills_core.load_skills(None, [str(root)]), capsys)
+    assert str(root) in error and "use --skill" in error
+
+
+def test_skill_wins_a_set_name_clash(tmp_path, capsys):
+    solo = _write_skill(tmp_path / "alpha")
+    nested = _write_skill(tmp_path / "set" / "alpha")
+    skills = skills_core.load_skills([str(solo)], [str(tmp_path / "set")])
+    assert skills == {"alpha": solo}
+    assert (nested / "SKILL.md").is_file()
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill alpha uses {solo}; dropped {nested}."
+    ]
+
+
+def test_later_skill_set_wins_a_name_clash(tmp_path):
+    first = _write_skill(tmp_path / "set-a" / "alpha")
+    second = _write_skill(tmp_path / "set-b" / "alpha")
+    skills = skills_core.load_skills(None, [str(tmp_path / "set-a"), str(tmp_path / "set-b")])
+    assert skills == {"alpha": second}
+
+
+def test_one_skill_set_later_path_wins_with_notice(tmp_path, capsys):
+    root = tmp_path / "root"
+    deep = _write_skill(root / "a" / "b" / "c" / "my-skill")
+    top = _write_skill(root / "a" / "my-skill")
+    far = _write_skill(root / "c" / "d" / "my-skill")
+    assert skills_core.load_skills(None, [str(root)]) == {"my-skill": far}
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill my-skill uses {far}; dropped {top}, {deep}."
+    ]
+
+
+def test_skill_set_invalid_name_suggests_upstream(tmp_path, capsys):
+    _write_skill(tmp_path / "set" / "Bad_Name")
+    error = _expect_fail(lambda: skills_core.load_skills(None, [str(tmp_path / "set")]), capsys)
+    assert "Bad_Name" in error
+    assert "Rename it upstream." in error
+    assert "NAME:" not in error
+
+
+def test_skill_set_namespace_prefixes_names(tmp_path):
+    set_root = tmp_path / "set"
+    alpha = _write_skill(set_root / "alpha", "---\nname: real-alpha\n---\nBody.\n")
+    beta = _write_skill(set_root / "beta")
+    skills = skills_core.load_skills(None, [f"ns1:{set_root}"])
+    assert list(skills.items()) == [("ns1-real-alpha", alpha), ("ns1-beta", beta)]
+
+
+def test_skill_set_namespace_written_skill_carries_the_prefixed_name(tmp_path):
+    alpha = _write_skill(tmp_path / "set" / "alpha", "---\nname: real-alpha\n---\nBody.\n")
+    skills = skills_core.load_skills(None, [f"ns1:{tmp_path / 'set'}"])
+    entry = skills_core.write_skills(tmp_path / "session", skills)["ns1-real-alpha"]
+    assert not entry.is_symlink()
+    assert skills_core.get_skill_name(entry) == "ns1-real-alpha"
+    assert (alpha / "SKILL.md").read_text() == "---\nname: real-alpha\n---\nBody.\n"
+
+
+def test_skill_set_prefixed_invalid_name_fails(tmp_path, capsys):
+    _write_skill(tmp_path / "set" / "Bad_Name")
+    error = _expect_fail(lambda: skills_core.load_skills(None, [f"ns1:{tmp_path / 'set'}"]), capsys)
+    assert "ns1-Bad_Name" in error
+    assert "Rename it upstream." in error
+
+
+@pytest.mark.parametrize("namespace", ["My_NS", "ns-"])
+def test_skill_set_invalid_namespace_fails_early(tmp_path, capsys, namespace):
+    _write_skill(tmp_path / "set" / "alpha")
+    error = _expect_fail(
+        lambda: skills_core.load_skills(None, [f"{namespace}:{tmp_path / 'set'}"]), capsys
+    )
+    assert f"Invalid --skill-set namespace {namespace!r}" in error
+    assert "use lowercase letters, digits and single hyphens." in error
+    assert "Rename it upstream" not in error
+
+
+@pytest.mark.parametrize("value", ["ns1:", ""])
+def test_skill_set_empty_path_fails_without_searching_cwd(tmp_path, monkeypatch, capsys, value):
+    _write_skill(tmp_path / "cwd-skill")
+    monkeypatch.chdir(tmp_path)
+    error = _expect_fail(lambda: skills_core.load_skills(None, [value]), capsys)
+    if value:
+        assert "--skill-set 'ns1:' needs a folder or URL after the namespace." in error
+    else:
+        assert "--skill-set '' needs a folder or URL." in error
+    assert "cwd-skill" not in error
+
+
+@pytest.mark.parametrize("length", [62, 63])
+def test_skill_set_namespace_length_boundary(tmp_path, capsys, length):
+    namespace = "n" * length
+    _write_skill(tmp_path / "set" / "alpha", "---\nname: a\n---\nBody.\n")
+    if length == 62:
+        assert list(skills_core.load_skills(None, [f"{namespace}:{tmp_path / 'set'}"])) == [
+            f"{namespace}-a"
+        ]
+    else:
+        error = _expect_fail(
+            lambda: skills_core.load_skills(None, [f"{namespace}:{tmp_path / 'set'}"]), capsys
+        )
+        assert f"Invalid --skill-set namespace {namespace!r}" in error
+
+
+def test_skill_set_same_folder_twice_prints_no_notice(tmp_path, capsys):
+    root = tmp_path / "set"
+    alpha = _write_skill(root / "alpha")
+    assert skills_core.load_skills(None, [str(root), str(root)]) == {"alpha": alpha}
+    assert capsys.readouterr().err == ""
+
+
+def test_url_skill_set_flattens_the_cache_then_reuses_it(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    calls = _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "README.md": "Set readme.\n",
+        "godot-one/SKILL.md": "One.\n",
+        "godot-one/references/guide.md": "Guide.\n",
+        "nested/godot-two/SKILL.md": "Two.\n",
+    })
+    expected = {"godot-one": target / "godot-one", "godot-two": target / "godot-two"}
+    assert skills_core.load_skills(None, [url]) == expected
+    assert [command[:2] for command, _ in calls] == [["/usr/bin/degit", url]]
+    assert list(target.parent.iterdir()) == [target]
+    assert not (target / "README.md").exists()
+    assert (target / "godot-one" / "references" / "guide.md").is_file()
+    assert skills_core.load_skills(None, [url]) == expected
+    assert len(calls) == 1
+    stdout = capsys.readouterr().out
+    assert "Using cached skill set" in stdout and str(target) in stdout
+
+
+def test_url_skill_set_cache_differs_from_the_skill_cache(tmp_path, monkeypatch):
+    url = "https://github.com/user/repo/tree/main/skills/remote-set"
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {"inner/SKILL.md": "Inner.\n"})
+    set_target = _cached_set_target(tmp_path, url, "remote-set")
+    skill_target = _cached_target(tmp_path, url, "remote-set")
+    assert skills_core.load_skills(None, [url]) == {"inner": set_target / "inner"}
+    _fake_degit(monkeypatch, tmp_path)
+    assert skills_core.load_skills([url]) == {"remote-set": skill_target}
+    assert set_target.parent != skill_target.parent
+    assert (skill_target / "SKILL.md").is_file()
+
+
+def test_url_skill_set_flatten_keeps_the_later_folder(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "first/godot-one/SKILL.md": "One.\n",
+        "second/godot-one/SKILL.md": "Two.\n",
+    })
+    assert skills_core.load_skills(None, [url]) == {"godot-one": target / "godot-one"}
+    assert (target / "godot-one" / "SKILL.md").read_text() == "Two.\n"
+    assert list(target.parent.iterdir()) == [target]
+    winner = target / "godot-one"
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill set {url}: skill godot-one uses {winner}; dropped {url}/first/godot-one."
+    ]
+    assert skills_core.load_skills(None, [url]) == {"godot-one": winner}
+    assert capsys.readouterr().err == ""
+
+
+def test_url_skill_set_flatten_keyed_by_skill_name(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    files = {
+        "a/zeta/SKILL.md": "---\nname: shared\n---\nEARLIER\n",
+        "z/alpha/SKILL.md": "---\nname: shared\n---\nLATER\n",
+    }
+    # A local set names the winner by source path, so the URL set must match it.
+    _write_skill(tmp_path / "local" / "a" / "zeta", "---\nname: shared\n---\nEARLIER\n")
+    _write_skill(tmp_path / "local" / "z" / "alpha", "---\nname: shared\n---\nLATER\n")
+    local = skills_core.load_skills(None, [str(tmp_path / "local")])
+    assert (local["shared"] / "SKILL.md").read_text().endswith("LATER\n")
+    capsys.readouterr()
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = files)
+    winner = target / "shared"
+    assert skills_core.load_skills(None, [url]) == {"shared": winner}
+    assert (winner / "SKILL.md").read_text().endswith("LATER\n")
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill set {url}: skill shared uses {winner}; dropped {url}/a/zeta."
+    ]
+    assert skills_core.load_skills(None, [url]) == {"shared": winner}
+    assert capsys.readouterr().err == ""
+
+
+def test_url_skill_set_flatten_invalid_folder_name_fails_like_local(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    local_root = tmp_path / "local"
+    _write_skill(local_root / "a" / "Pdf", "EARLIER\n")
+    _write_skill(local_root / "b" / "pdf", "LATER\n")
+    error = _expect_fail(lambda: skills_core.load_skills(None, [str(local_root)]), capsys)
+    assert "Invalid skill name 'Pdf'" in error
+    assert "Rename it upstream." in error
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "a/Pdf/SKILL.md": "EARLIER\n",
+        "b/pdf/SKILL.md": "LATER\n",
+    })
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert "Invalid skill name 'Pdf'" in error
+    assert "Rename it upstream." in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+
+
+def test_url_skill_set_invalid_frontmatter_name_fails_like_local(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    broken = "---\nname: Bad_Name\n---\nEARLIER\n"
+    valid = "---\nname: shared\n---\nVALID\n"
+    local_root = tmp_path / "local"
+    _write_skill(local_root / "a" / "shared", broken)
+    _write_skill(local_root / "z" / "shared", valid)
+    error = _expect_fail(lambda: skills_core.load_skills(None, [str(local_root)]), capsys)
+    assert "Invalid skill name 'Bad_Name'" in error
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "a/shared/SKILL.md": broken,
+        "z/shared/SKILL.md": valid,
+    })
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert "Invalid skill name 'Bad_Name'" in error
+    assert "Rename it upstream." in error
+    assert not target.exists()
+
+
+def test_url_skill_set_broken_frontmatter_fails_like_local(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    broken = "---\nname: [broken\n---\nEARLIER\n"
+    valid = "---\nname: shared\n---\nVALID\n"
+    local_root = tmp_path / "local"
+    _write_skill(local_root / "a" / "shared", broken)
+    _write_skill(local_root / "z" / "shared", valid)
+    error = _expect_fail(lambda: skills_core.load_skills(None, [str(local_root)]), capsys)
+    assert "Could not parse skill frontmatter" in error
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "a/shared/SKILL.md": broken,
+        "z/shared/SKILL.md": valid,
+    })
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert "Could not parse skill frontmatter" in error
+    assert not target.exists()
+
+
+def test_url_skill_set_flatten_notice_has_no_double_slash(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot/"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "first/one/SKILL.md": "One.\n",
+        "second/one/SKILL.md": "Two.\n",
+    })
+    winner = target / "one"
+    assert skills_core.load_skills(None, [url]) == {"one": winner}
+    base = url.rstrip("/")
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill set {url}: skill one uses {winner}; dropped {base}/first/one."
+    ]
+
+
+def test_url_skill_set_flatten_keeps_distinct_skill_names(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "a/dupe/SKILL.md": "---\nname: first-one\n---\nOne.\n",
+        "b/dupe/SKILL.md": "---\nname: second-one\n---\nTwo.\n",
+    })
+    assert skills_core.load_skills(None, [url]) == {
+        "first-one": target / "first-one", "second-one": target / "second-one",
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_url_skill_set_flatten_notice_lists_drops_latest_first(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {
+        "a/one/SKILL.md": "One.\n",
+        "b/one/SKILL.md": "Two.\n",
+        "c/one/SKILL.md": "Three.\n",
+    })
+    winner = target / "one"
+    assert skills_core.load_skills(None, [url]) == {"one": winner}
+    assert capsys.readouterr().err.splitlines() == [
+        f"agent-switch: skill set {url}: skill one uses {winner}; "
+        f"dropped {url}/b/one, {url}/a/one."
+    ]
+
+
+def test_url_skill_set_broken_skill_md_symlink_names_the_skill(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+
+    def broken_link(command, *args, **kwargs):
+        destination = Path(command[-1])
+        skill = destination / "a" / "odd"
+        skill.mkdir(parents = True)
+        (skill / "SKILL.md").symlink_to(destination / "shared.md")
+        return subprocess.CompletedProcess(command, 0)
+
+    _fake_degit(monkeypatch, tmp_path)
+    monkeypatch.setattr(skills_core.subprocess, "run", broken_link)
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert f"Skill path {url}/a/odd must be a directory holding SKILL.md." in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason = "POSIX file modes")
+def test_url_skill_set_unreadable_skill_md_names_the_skill(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+
+    def locked_file(command, *args, **kwargs):
+        destination = Path(command[-1])
+        skill = destination / "a" / "odd"
+        skill.mkdir(parents = True)
+        path = skill / "SKILL.md"
+        path.write_text("Odd.\n")
+        path.chmod(0o000)
+        return subprocess.CompletedProcess(command, 0)
+
+    _fake_degit(monkeypatch, tmp_path)
+    monkeypatch.setattr(skills_core.subprocess, "run", locked_file)
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert f"Cannot read {url}/a/odd/SKILL.md." in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+
+
+def test_url_skill_set_namespace_prefixes_names(tmp_path, monkeypatch):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {"godot-one/SKILL.md": "One.\n"})
+    skills = skills_core.load_skills(None, [f"ns1:{url}"])
+    assert skills == {"ns1-godot-one": target / "godot-one"}
+
+
+def test_url_skill_set_reuses_a_target_published_mid_flatten(tmp_path, monkeypatch):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+
+    def publish_first(command, *args, **kwargs):
+        destination = Path(command[-1])
+        (destination / "alpha").mkdir()
+        (destination / "alpha" / "SKILL.md").write_text("Skill body.\n")
+        # Simulate the other concurrent run: its cache lands before this flatten publishes.
+        (target / "alpha").mkdir(parents = True)
+        (target / "alpha" / "SKILL.md").write_text("Skill body.\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    _fake_degit(monkeypatch, tmp_path)
+    monkeypatch.setattr(skills_core.subprocess, "run", publish_first)
+    assert skills_core.load_skills(None, [url]) == {"alpha": target / "alpha"}
+    assert list(target.parent.iterdir()) == [target]
+
+
+def test_url_skill_set_move_failure_leaves_no_cache(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(monkeypatch, tmp_path, skill_md = False, files = {"alpha/SKILL.md": "Skill body.\n"})
+    replace = Path.replace
+
+    def refuse_replace(self, destination):
+        if self.name == "alpha":
+            raise PermissionError(13, "Permission denied", str(self))
+        return replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", refuse_replace)
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert url in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+
+
+def test_url_skill_set_never_follows_links_out_of_the_download(tmp_path, monkeypatch):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    victim = tmp_path / "victim"
+    _write_skill(victim / "my-skill")
+    target = _cached_set_target(tmp_path, url, "godot")
+
+    def link_outside(command, *args, **kwargs):
+        destination = Path(command[-1])
+        (destination / "ok-skill").mkdir()
+        (destination / "ok-skill" / "SKILL.md").write_text("Skill body.\n")
+        (destination / "evil").symlink_to(victim, target_is_directory = True)
+        return subprocess.CompletedProcess(command, 0)
+
+    _fake_degit(monkeypatch, tmp_path)
+    monkeypatch.setattr(skills_core.subprocess, "run", link_outside)
+    assert skills_core.load_skills(None, [url]) == {"ok-skill": target / "ok-skill"}
+    assert (victim / "my-skill").is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason = "POSIX folder modes")
+def test_url_skill_set_unreadable_download_folder_leaves_no_cache(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+
+    def locked_folder(command, *args, **kwargs):
+        destination = Path(command[-1])
+        (destination / "alpha").mkdir()
+        (destination / "alpha" / "SKILL.md").write_text("Skill body.\n")
+        locked = destination / "locked"
+        locked.mkdir()
+        locked.chmod(0o000)
+        created.append(locked)
+        return subprocess.CompletedProcess(command, 0)
+
+    created = []
+    _fake_degit(monkeypatch, tmp_path)
+    monkeypatch.setattr(skills_core.subprocess, "run", locked_folder)
+    try:
+        error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    finally:
+        for locked in created:
+            locked.chmod(0o700)
+    assert "locked" in error
+    assert not target.exists()
+
+
+def test_url_skill_set_missing_degit_names_the_flag(tmp_path, monkeypatch, capsys):
+    _fake_degit(monkeypatch, tmp_path, degit = None)
+    error = _expect_fail(
+        lambda: skills_core.load_skills(None, ["https://github.com/user/repo/tree/main/skills/godot"]),
+        capsys,
+    )
+    assert "--skill-set https://github.com/user/repo/tree/main/skills/godot needs degit" in error
+    assert "npm install -g degit" in error
+
+
+@pytest.mark.parametrize("kind", ["no-skill", "root-skill"])
+def test_url_skill_set_without_nested_skills_leaves_no_cache(tmp_path, monkeypatch, capsys, kind):
+    url = "https://github.com/user/repo/tree/main/skills/godot"
+    target = _cached_set_target(tmp_path, url, "godot")
+    _fake_degit(
+        monkeypatch, tmp_path, skill_md = kind == "root-skill",
+        files = {"nested/godot-skill/SKILL.md": "Nested.\n"} if kind == "root-skill" else None,
+    )
+    error = _expect_fail(lambda: skills_core.load_skills(None, [url]), capsys)
+    assert "Use --skill" in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
 
 
 @pytest.mark.parametrize(("text", "name"), [

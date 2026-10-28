@@ -1058,6 +1058,20 @@ def test_native_pi_skill_overlay_preserves_config_and_filters_names(fake_vllm, t
     assert _get_skill_snapshot(user_agent) == before_user_agent
 
 
+def test_native_pi_skill_set_injects_nested_skills(fake_vllm, tmp_path, monkeypatch, pi_skill_sources):
+    _native_no_connect_pi(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    set_root = tmp_path / "set"
+    alpha = set_root / "group" / "alpha"
+    alpha.mkdir(parents = True)
+    (alpha / "SKILL.md").write_text("Nested.\n")
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--skill-set", str(set_root)])
+    assert result.exit_code == 0, result.output
+    overlay = tmp_path / "agents" / "pi-native" / "agent"
+    assert (overlay / "skills" / "alpha").is_symlink()
+    assert (overlay / "skills" / "alpha").resolve() == alpha
+
+
 @pytest.mark.parametrize("should_persist", [False, True])
 def test_routed_pi_skill_overlay_preserves_settings_and_restores_whole_link(fake_vllm, tmp_path, pi_skill_sources, should_persist):
     user_agent, source = pi_skill_sources

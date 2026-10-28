@@ -61,6 +61,7 @@ from agent_switch.core.options import (
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
     _SKILL_OPTION,
+    _SKILL_SET_OPTION,
     _SUBAGENT_DESCRIPTION,
     _TEMPERATURE_OPTION,
     _TOP_K_OPTION,
@@ -637,6 +638,7 @@ def codex(
     mcp_stdio: Optional[list[str]] = _MCP_STDIO_OPTION,
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
     skill: Optional[list[str]] = _SKILL_OPTION,
+    skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
 ):
     """Point OpenAI Codex at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -650,7 +652,7 @@ def codex(
         envs = mcp_env,
         as_subagent = as_subagent,
     )
-    skills = load_skills(skill, as_subagent = as_subagent)
+    skills = load_skills(skill, skill_set, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
     if target is None:
         _refuse_local_only(
@@ -676,8 +678,8 @@ def codex(
         _fail("--as-subagent is not supported for agent aliases.")
     if alias and skills:
         _fail(
-            "--skill is not supported for codex aliases: the alias sets its own CODEX_HOME; "
-            "use `agent-switch codex`."
+            "--skill and --skill-set are not supported for codex aliases: the alias sets "
+            "its own CODEX_HOME; use `agent-switch codex`."
         )
     if alias and target is not None:
         # The function sets its own CODEX_HOME, which outranks the session env, so the session
@@ -703,7 +705,7 @@ def codex(
         version = _codex_executable_version(executable) if executable and skills else None
         if version is not None and version < _CODEX_SKILL_NAME_MIN_VERSION:
             _fail(
-                f"Codex {'.'.join(map(str, version))} is too old for --skill; "
+                f"Codex {'.'.join(map(str, version))} is too old for --skill/--skill-set; "
                 f"0.117.0 or newer is needed. Upgrade it with: {install_hint}"
             )
         # Without injected skills, native launch leaves CODEX_HOME untouched.
