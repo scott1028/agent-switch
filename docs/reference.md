@@ -419,6 +419,22 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   directory; `~` expands to your home directory. The skill name comes from `NAME:`, then the file's
   frontmatter `name`, then the folder name. Names must use lowercase letters, digits, and single
   hyphens, up to 64 characters. Repeated names fail.
+- `PATH` can also be a URL that starts with a scheme such as `https://`, and `NAME:URL` works
+  too. agent-switch downloads it with [degit](https://github.com/Rich-Harris/degit) into
+  `<temp dir>/agent-switch-skills-<uid>/<hash>/<leaf>`: on Linux the temp dir is `$TMPDIR`,
+  else `/tmp`; on Windows the root is `agent-switch-skills` in your per-user temp folder. That
+  root must be a private folder you own, or agent-switch stops: remove it, or point `TMPDIR`
+  at a private folder, because a folder another user created in a shared `/tmp` cannot be
+  removed by you. `<leaf>` is the URL's last path segment with `.git` removed and other
+  characters made folder-safe; it is the folder-name fallback for the skill name. A later
+  run with the same URL reuses that folder and prints its path; delete the folder to
+  download it again. A different `#ref` gets its own folder. degit must be installed
+  (`npm install -g degit`); without it, agent-switch stops with that hint. GitHub
+  `/tree/<ref>/<dir>` links need degit 3 or newer, because degit 2 reads `tree/<ref>` as a
+  folder. degit also runs a `degit.json` found in the downloaded folder, and its actions can
+  read your environment variables, so use only URLs you trust. Short forms such as
+  `user/repo` or `github:user/repo` are read as a local path or as `NAME:`, so use the full
+  URL.
 - Skills cannot be combined with `--as-subagent`. `--skill` is not supported for Codex, Pi,
   dsh-tui, or dst aliases.
 - agent-switch puts injected files in its session folder. A skill whose frontmatter `name` already
@@ -437,6 +453,7 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
 agent-switch claude --skill /tmp/skills/my-test-skill
 agent-switch codex --skill docs:/tmp/skills/guide --skill /tmp/skills/review
 agent-switch dsh --url http://127.0.0.1:8080 --skill /tmp/skills/my-test-skill
+agent-switch claude --skill https://github.com/user/repo/tree/main/skills/my-skill
 ```
 
 | Agent | How the skill is loaded | Which same-name skill wins |

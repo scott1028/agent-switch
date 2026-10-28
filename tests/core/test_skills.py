@@ -3,8 +3,10 @@
 
 """Session skill parsing, isolated materialization and owned-entry cleanup."""
 
+import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,190 @@ def test_home_and_relative_paths_are_absolute(tmp_path, monkeypatch):
     assert skills_core.load_skills(["~/home-skill", "./relative-skill"]) == {
         "home-skill": home_skill, "relative-skill": relative_skill
     }
+
+
+_PROBE_ENV_SENTINEL = {"PATH": "probe-env"}
+
+
+def _fake_degit(monkeypatch, tmp_path, *, degit = "/usr/bin/degit", returncode = 0, skill_md = True):
+    calls = []
+
+    def fake_run(command, *args, **kwargs):
+        calls.append((command, kwargs))
+        destination = Path(command[-1])
+        if returncode:
+            # Leave a partial download at the destination, the way a killed degit would.
+            (destination / "partial.txt").write_text("Half a download.\n")
+        elif skill_md:
+            (destination / "SKILL.md").write_text("Skill body.\n")
+        else:
+            (destination / "README.md").write_text("No skill here.\n")
+        if returncode and kwargs.get("check"):
+            raise subprocess.CalledProcessError(returncode, command)
+        return subprocess.CompletedProcess(command, returncode)
+
+    monkeypatch.setattr(skills_core.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(skills_core, "_which_with_install_dirs", lambda name: degit)
+    monkeypatch.setattr(skills_core, "_probe_env", lambda **extra: _PROBE_ENV_SENTINEL)
+    monkeypatch.setattr(skills_core.subprocess, "run", fake_run)
+    return calls
+
+
+def _cache_root(tmp_path):
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    return tmp_path / f"agent-switch-skills{suffix}"
+
+
+def _cached_target(tmp_path, url, leaf):
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    return _cache_root(tmp_path) / digest / leaf
+
+
+def test_url_skill_downloads_once_then_uses_cache(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/remote-skill"
+    target = _cached_target(tmp_path, url, "remote-skill")
+    calls = _fake_degit(monkeypatch, tmp_path)
+    assert skills_core.load_skills([url]) == {"remote-skill": target}
+    assert [command[:2] for command, _ in calls] == [["/usr/bin/degit", url]]
+    assert calls[0][1]["env"] is _PROBE_ENV_SENTINEL
+    assert skills_core.load_skills([url]) == {"remote-skill": target}
+    assert len(calls) == 1
+    stdout = capsys.readouterr().out
+    assert str(target) in stdout and "delete" in stdout
+
+
+def test_named_url_skill_renames_and_passes_full_url(tmp_path, monkeypatch):
+    url = "https://github.com/user/repo/tree/main/skills/remote-skill"
+    calls = _fake_degit(monkeypatch, tmp_path)
+    skills = skills_core.load_skills([f"renamed:{url}"])
+    assert skills == {"renamed": _cached_target(tmp_path, url, "remote-skill")}
+    assert [command[:2] for command, _ in calls] == [["/usr/bin/degit", url]]
+
+
+def test_url_skill_runs_the_resolved_shim_command(tmp_path, monkeypatch):
+    url = "https://github.com/user/repo/tree/feat&docs/skills/foo"
+    calls = _fake_degit(monkeypatch, tmp_path)
+    resolved = []
+
+    def record_resolved(executable, arguments, environment = None):
+        resolved.append((executable, arguments, environment))
+        return ["node", "degit.js", *arguments]
+
+    monkeypatch.setattr(skills_core, "_resolved_launch_command", record_resolved)
+    assert skills_core.load_skills([url]) == {"foo": _cached_target(tmp_path, url, "foo")}
+    command, kwargs = calls[0]
+    assert command[:3] == ["node", "degit.js", url]
+    assert Path(command[-1]).parent == _cached_target(tmp_path, url, "foo").parent
+    assert resolved == [("/usr/bin/degit", [url, command[-1]], _PROBE_ENV_SENTINEL)]
+    assert kwargs["env"] is _PROBE_ENV_SENTINEL
+
+
+def test_missing_degit_fails_before_touching_cache(tmp_path, monkeypatch, capsys):
+    calls = _fake_degit(monkeypatch, tmp_path, degit = None)
+    error = _expect_fail(
+        lambda: skills_core.load_skills(["https://github.com/user/repo"]), capsys
+    )
+    assert "npm install -g degit" in error
+    assert calls == []
+    # The empty private root may exist; no hash folder may be created.
+    root = _cache_root(tmp_path)
+    assert not root.exists() or list(root.iterdir()) == []
+
+
+def test_failed_degit_leaves_no_partial_and_retries(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/remote-skill"
+    target = _cached_target(tmp_path, url, "remote-skill")
+    calls = _fake_degit(monkeypatch, tmp_path, returncode = 1)
+    for _ in range(2):
+        error = _expect_fail(lambda: skills_core.load_skills([url]), capsys)
+    assert "degit could not download skill" in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+    assert len(calls) == 2
+
+
+def test_unrunnable_degit_fails_cleanly(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/remote-skill"
+    target = _cached_target(tmp_path, url, "remote-skill")
+
+    def refuse(command, *args, **kwargs):
+        raise OSError("degit is not executable")
+
+    _fake_degit(monkeypatch, tmp_path)
+    monkeypatch.setattr(skills_core.subprocess, "run", refuse)
+    error = _expect_fail(lambda: skills_core.load_skills([url]), capsys)
+    assert "degit could not download skill" in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+
+
+def test_degit_without_skill_md_never_becomes_cache(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/remote-skill"
+    target = _cached_target(tmp_path, url, "remote-skill")
+    calls = _fake_degit(monkeypatch, tmp_path, skill_md = False)
+    for _ in range(2):
+        error = _expect_fail(lambda: skills_core.load_skills([url]), capsys)
+    assert "no SKILL.md" in error
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX cache root ownership")
+@pytest.mark.parametrize("kind", [
+    "wide-mode", "symlink", "dangling-symlink", "regular-file", "foreign-owner",
+])
+def test_unsafe_cache_root_stops_and_never_reuses(tmp_path, monkeypatch, capsys, kind):
+    url = "https://github.com/user/repo/tree/main/skills/remote-skill"
+    uid = os.getuid()
+    root = tmp_path / f"agent-switch-skills-{uid + 1 if kind == 'foreign-owner' else uid}"
+    cached_root = root
+    if kind == "symlink":
+        real = tmp_path / "elsewhere"
+        real.mkdir()
+        os.chmod(real, 0o700)
+        root.symlink_to(real, target_is_directory = True)
+        cached_root = real
+    elif kind == "dangling-symlink":
+        root.symlink_to(tmp_path / "missing", target_is_directory = True)
+    elif kind == "regular-file":
+        root.write_text("Keep me.\n")
+    else:
+        root.mkdir()
+        # Set the mode directly; mkdir mode is subject to the umask.
+        os.chmod(root, 0o777 if kind == "wide-mode" else 0o700)
+    if kind in ("symlink", "wide-mode", "foreign-owner"):
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+        _write_skill(cached_root / digest / "remote-skill")
+    calls = _fake_degit(monkeypatch, tmp_path)
+    if kind == "foreign-owner":
+        monkeypatch.setattr(skills_core.os, "getuid", lambda: uid + 1)
+    error = _expect_fail(lambda: skills_core.load_skills([url]), capsys)
+    assert str(root) in error
+    assert calls == []
+
+
+@pytest.mark.parametrize(("url", "name"), [
+    ("https://github.com/user/my-skill.git", "my-skill"),
+    ("https://github.com/", "skill"),
+    ("https://github.com/user/repo/..", "skill"),
+    ("https://github.com/user/repo/..\\..\\x", "x"),
+    ("https://github.com/user/repo/-x-.", "x"),
+    ("https://github.com/user/repo/a%20b", "a-20b"),
+])
+def test_url_leaf_is_the_fallback_name(tmp_path, monkeypatch, url, name):
+    calls = _fake_degit(monkeypatch, tmp_path)
+    assert skills_core.load_skills([url]) == {name: _cached_target(tmp_path, url, name)}
+    assert len(calls) == 1
+
+
+def test_invalid_url_leaf_fails_with_name_hint(tmp_path, monkeypatch, capsys):
+    url = "https://github.com/user/repo/tree/main/skills/my.skill_x"
+    _fake_degit(monkeypatch, tmp_path)
+    target = _cached_target(tmp_path, url, "my.skill_x")
+    error = _expect_fail(lambda: skills_core.load_skills([url]), capsys)
+    assert "NAME:" in error and "my.skill_x" in error
+    assert (target / "SKILL.md").is_file()
 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "no-manifest", "manifest-is-dir"])

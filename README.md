@@ -137,10 +137,14 @@ for that session. [Registry format, authentication, and examples](docs/reference
 ```sh
 agent-switch claude --skill /tmp/skills/my-test-skill
 agent-switch codex --skill skill1:/tmp/skills/my-test-skill --skill /tmp/skills/my-test-skill2
+agent-switch claude --skill https://github.com/user/repo/tree/main/skills/my-skill
 ```
 
 - `--skill` works with or without `--url` or `--provider`.
 - Add `NAME:` before a path to give that skill a different name.
+- A URL is downloaded with `degit` (degit 3 or newer; install it first with
+  `npm install -g degit`) and reused on later runs; delete the folder it prints on a later
+  run to download it again.
 - An injected skill wins a same-name clash, with the agent-specific exceptions in the reference.
 - Edits show up live. If renaming rewrites `SKILL.md`, edit the source and restart to refresh the copy.
 

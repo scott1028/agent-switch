@@ -3,15 +3,23 @@
 
 """Session skill folders: parse names, validate sources and materialize isolated entries."""
 
+import hashlib
 import os
 import re
 import shutil
+import stat
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
+import typer
 import yaml
 
-from agent_switch.core.mcp import _parse_name_value
+from agent_switch.core.install import _probe_env, _which_with_install_dirs
+from agent_switch.core.launch import _resolved_launch_command
+from agent_switch.core.mcp import _URL_SCHEME_RE, _parse_name_value
 from agent_switch.core.options import _fail
 from agent_switch.core.platform import _create_directory_junction, _is_junction, _remove_overlay_entry
 from agent_switch.core.storage import _read_json_object, _write_private_json
@@ -63,16 +71,77 @@ def get_skill_name(skill_dir: Path, *, should_fail: bool = True) -> Optional[str
     return name if isinstance(name, str) else None
 
 
+def _download_skill(url: str) -> Path:
+    """Fetch a degit URL into a private per-user temp cache, reusing a folder downloaded earlier."""
+    leaf = urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
+    if leaf.endswith(".git"):
+        leaf = leaf[:-4]
+    # The URL's last path segment is the fallback skill name, kept folder-safe.
+    leaf = re.sub(r"[^A-Za-z0-9._-]", "-", leaf).strip(".-") or "skill"
+    # A shared /tmp needs one private root per user; the Windows temp dir is already per-user.
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    root = Path(tempfile.gettempdir()) / f"agent-switch-skills{suffix}"
+    is_unsafe = False
+    try:
+        # A root that someone else owns, opened up, is a symlink, or is not a folder at all
+        # can carry a planted skill, so verify it before trusting anything under it.
+        root.mkdir(mode = 0o700, exist_ok = True)
+        if hasattr(os, "getuid"):
+            status = os.lstat(root)
+            is_unsafe = bool(
+                stat.S_ISLNK(status.st_mode)
+                or status.st_uid != os.getuid()
+                or status.st_mode & 0o077
+            )
+    except OSError:
+        is_unsafe = True
+    if is_unsafe:
+        _fail(
+            f"Cannot use skill cache {root}: it must be a private folder you own. "
+            "Remove it, or set TMPDIR to a private folder, then re-run."
+        )
+    target = root / hashlib.sha256(url.encode("utf-8")).hexdigest()[:12] / leaf
+    if target.is_dir():
+        typer.echo(f"Using cached skill {url} from {target}; delete that folder to download it again.")
+        return target
+    degit = _which_with_install_dirs("degit")
+    if degit is None:
+        _fail(f"--skill {url} needs degit. Install it with `npm install -g degit`, then re-run.")
+    target.parent.mkdir(mode = 0o700, exist_ok = True)
+    # Download into a fresh empty folder, then rename, so a failed run never looks like a cache.
+    partial = Path(tempfile.mkdtemp(dir = target.parent))
+    # The shim resolver keeps a raw & in the URL out of cmd.exe, and the probe env carries the
+    # augmented PATH, so a degit with node in an install dir runs as _which_with_install_dirs found it.
+    env = _probe_env()
+    try:
+        subprocess.run(_resolved_launch_command(degit, [url, str(partial)], env), env = env, check = True)
+    except (OSError, subprocess.CalledProcessError):
+        shutil.rmtree(partial, ignore_errors = True)
+        _fail(f"degit could not download skill {url}.")
+    if not (partial / "SKILL.md").is_file():
+        shutil.rmtree(partial, ignore_errors = True)
+        _fail(f"degit downloaded {url}, but the folder has no SKILL.md.")
+    partial.replace(target)
+    return target
+
+
 def load_skills(values: Optional[list], *, as_subagent: bool = False) -> Optional[dict]:
-    """Resolve repeated [NAME:]PATH values into ordered names and absolute source folders."""
+    """Resolve repeated [NAME:]PATH|URL values into ordered names and absolute source folders."""
     if not values:
         return None
     if as_subagent:
         _fail("--skill cannot be combined with --as-subagent.")
     skills = {}
     for value in values:
-        given_name, path = _parse_name_value(value)
-        source = Path(os.path.abspath(os.path.expanduser(path)))
+        if _URL_SCHEME_RE.match(value):
+            # A bare URL is the whole path; only NAME:URL carries a name.
+            given_name, path = None, value
+        else:
+            given_name, path = _parse_name_value(value)
+        if _URL_SCHEME_RE.match(path):
+            source = _download_skill(path)
+        else:
+            source = Path(os.path.abspath(os.path.expanduser(path)))
         if not source.is_dir() or not (source / "SKILL.md").is_file():
             _fail(f"Skill path {source} must be a directory holding SKILL.md.")
         name = given_name

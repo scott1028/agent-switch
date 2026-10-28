@@ -366,9 +366,9 @@ _MCP_STDIO_OPTION = typer.Option(
 _SKILL_OPTION = typer.Option(
     None,
     "--skill",
-    metavar = "[NAME:]PATH",
+    metavar = "[NAME:]PATH|URL",
     rich_help_panel = _PANEL_SESSION,
-    help = "Add a skill folder for this session; NAME: renames it.",
+    help = "Add a skill folder or degit URL; NAME: renames it.",
 )
 
 
