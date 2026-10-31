@@ -256,6 +256,12 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 - OpenCode also gets `none/low/medium/high/xhigh/max` effort variants for every model
   (`provider/model#xhigh` in its model picker). On OpenCode 2.x a pinned `--reasoning-effort` wins
   over a chosen variant; on 1.x the variant wins.
+- Pi (0.84.0 or later) on llama.cpp, vLLM or another OpenAI-compatible server picks the thinking
+  level itself: `/thinking` and Shift+Tab switch it between `off` and `max`, and a session starts at
+  `xhigh` (a level saved in a `--persist` session stays). llama.cpp and vLLM get it as
+  `chat_template_kwargs`; other servers get `reasoning_effort`. `--reasoning off` and
+  `--reasoning-effort` only set the starting level, and `--reasoning auto` leaves thinking to the
+  server. LM Studio and Ollama keep the pinned behaviour above.
 - `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty` and `--presence-penalty`
   are set in the agent's own requests, not on the server. Unset keeps the model's recommended
   sampling; a value the agent cannot send is ignored with a warning.

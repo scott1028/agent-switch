@@ -121,7 +121,13 @@ def test_session_flags_ride_in_the_agent_config_on_a_running_server(
     result = CliRunner().invoke(start.start_app, [agent, "--url", BASE, "--no-launch", *_SESSION_FLAGS])
     assert result.exit_code == 0, result.output
     assert "already running" not in result.output
-    assert _session_request_body(agent, tmp_path, result.output) == _SESSION_BODY
+    expected = _SESSION_BODY
+    if agent == "pi":
+        # Pi takes --reasoning off as its starting thinking level, not a pinned body field.
+        expected = {"temperature": 0.3, "top_k": 40}
+        command = _launch_command(result.output)
+        assert command[command.index("--thinking") + 1] == "off"
+    assert _session_request_body(agent, tmp_path, result.output) == expected
 
 
 @pytest.mark.parametrize("agent", ["pi", "opencode", "claude"])
@@ -301,12 +307,104 @@ def test_connect_pi_no_launch(fake_vllm, tmp_path, monkeypatch):
     config = json.loads((home / ".pi" / "agent" / "models.json").read_text())
     assert config["providers"]["agent-switch"]["apiKey"] == KEY
     assert config["providers"]["agent-switch"]["models"] == [
-        {"id": MODEL["id"], "contextWindow": MODEL["context_length"], "maxTokens": 32000}
+        {
+            "id": MODEL["id"],
+            "reasoning": True,
+            "thinkingLevelMap": pi_agent._PI_THINKING_LEVEL_MAP,
+            "compat": pi_agent._PI_CHAT_TEMPLATE_COMPAT,
+            "contextWindow": MODEL["context_length"],
+            "maxTokens": 32000,
+        }
     ]
     assert (home / ".pi" / "agent" / "extensions" / "mine.ts").is_file()
     settings = json.loads((home / ".pi" / "agent" / "settings.json").read_text())
-    assert settings == {"packages": ["npm:pi-mine"]}
+    assert settings == {"packages": ["npm:pi-mine"], "defaultThinkingLevel": "xhigh"}
     assert not (user_agent_dir / "models.json").exists()
+
+
+def _run_pi_no_launch(*args):
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", *args])
+    assert result.exit_code == 0, result.output
+    return _launch_command(result.output)
+
+
+def _pi_session_rows(tmp_path):
+    models_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "models.json"
+    return json.loads(models_path.read_text())["providers"]["agent-switch"]["models"]
+
+
+def _pi_session_settings(tmp_path):
+    # The session gets settings.json only when something writes to it.
+    settings_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "settings.json"
+    return json.loads(settings_path.read_text()) if settings_path.exists() else {}
+
+
+@pytest.mark.parametrize("provider", ["vllm", "llamacpp"])
+def test_pi_thinking_rides_in_chat_template_kwargs(fake_vllm, tmp_path, provider):
+    _run_pi_no_launch("--provider", provider, "--temperature", "0.3", "--reasoning-effort", "high")
+    for row in _pi_session_rows(tmp_path):
+        assert row["reasoning"] is True
+        assert row["thinkingLevelMap"] == {"xhigh": "xhigh", "max": "max"}
+        assert row["compat"] == {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+                "enable_thinking": {"$var": "thinking.enabled"},
+                "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": True},
+            },
+        }
+        # The level is pi's own, so a pinned body must not override it.
+        assert row["samplingParams"] == {"temperature": 0.3}
+
+
+def test_pi_thinking_rides_in_reasoning_effort_on_openai_servers(fake_vllm, tmp_path):
+    _run_pi_no_launch("--provider", "openai")
+    for row in _pi_session_rows(tmp_path):
+        assert row["reasoning"] is True
+        assert row["thinkingLevelMap"] == {"xhigh": "xhigh", "max": "max"}
+        assert "compat" not in row
+
+
+def test_pi_keeps_a_thinking_level_saved_in_a_persisted_session(fake_vllm, tmp_path):
+    _run_pi_no_launch()
+    settings_path = tmp_path / "agents" / "pi" / ".pi" / "agent" / "settings.json"
+    settings_path.write_text(json.dumps({"defaultThinkingLevel": "low"}))
+    _run_pi_no_launch()
+    assert _pi_session_settings(tmp_path)["defaultThinkingLevel"] == "low"
+
+
+@pytest.mark.parametrize(
+    ("flags", "level"),
+    [
+        (["--reasoning-effort", "high"], "high"),
+        (["--reasoning-effort", "none"], "off"),
+        (["--reasoning", "off"], "off"),
+        (["--reasoning", "off", "--reasoning-effort", "high"], "off"),
+    ],
+)
+def test_pi_reasoning_flags_set_the_starting_thinking_level(fake_vllm, tmp_path, flags, level):
+    command = _run_pi_no_launch(*flags, "--", "--thinking", "low")
+    # agent-switch's own --thinking wins over a passed-through one.
+    assert command.count("--thinking") == 1
+    assert command[command.index("--thinking") + 1] == level
+
+
+@pytest.mark.parametrize("flags", [[], ["--reasoning", "on"]])
+def test_pi_starts_at_the_session_default_level(fake_vllm, tmp_path, flags):
+    assert "--thinking" not in _run_pi_no_launch(*flags)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--provider", "lmstudio"], ["--provider", "ollama"], ["--reasoning", "auto"]],
+)
+def test_pi_thinking_stays_off_where_pi_cannot_set_it(fake_vllm, tmp_path, monkeypatch, flags):
+    # The vLLM-shaped fake cannot answer LM Studio or Ollama, so stand in for the connection.
+    set_start_attr(monkeypatch, "_connect", lambda *args, **kwargs: (BASE, KEY, dict(MODEL)))
+    set_start_attr(monkeypatch, "_get_served_models", lambda *args: [])
+    assert "--thinking" not in _run_pi_no_launch(*flags, "--reasoning-effort", "high")
+    for row in _pi_session_rows(tmp_path):
+        assert "reasoning" not in row
+    assert "defaultThinkingLevel" not in _pi_session_settings(tmp_path)
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks and path forms")
@@ -783,7 +881,7 @@ def test_pi_launch_clears_screen_first(fake_vllm, monkeypatch):
     # clear must come BEFORE the exec, and only on the launch path.
     calls = []
     monkeypatch.setattr(click, "clear", lambda: calls.append("clear"))
-    monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/pi")
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/pi")
 
     def run(command, env):
         calls.append("exec")
@@ -812,7 +910,7 @@ def test_pi_no_launch_does_not_clear(fake_vllm, monkeypatch):
 def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_vllm, monkeypatch):
     captured = {}
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
-    monkeypatch.setattr(shutil, "which", lambda _: "/mnt/c/Users/x/AppData/Roaming/npm/pi")
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/mnt/c/Users/x/AppData/Roaming/npm/pi")
 
     def run(command, env):
         captured["env"] = env

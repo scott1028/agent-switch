@@ -10,6 +10,7 @@ from typing import Literal, Optional
 
 import typer
 
+from agent_switch import providers
 from agent_switch.core.install import (
     _agent_version_at_least,
     _npm_install_hint,
@@ -53,8 +54,10 @@ from agent_switch.core.options import (
     _PRESENCE_PENALTY_OPTION,
     _PROVIDER_OPTION,
     _REASONING_EFFORT_OPTION,
+    _REASONING_EFFORTS,
     _REASONING_OPTION,
     _REPETITION_PENALTY_OPTION,
+    _SAMPLING_FIELDS,
     _SKILL_OPTION,
     _SKILL_SET_OPTION,
     _TEMPERATURE_OPTION,
@@ -102,6 +105,20 @@ _PI_USER_RESOURCES_MANIFEST = ".agent-switch-user-resources.json"
 _PI_SAMPLING_PARAMS_MIN_VERSION = (0, 84, 0)
 
 
+# Pi lists xhigh and max only when the model maps them.
+_PI_THINKING_LEVEL_MAP = {"xhigh": "xhigh", "max": "max"}
+
+
+# llama.cpp and vLLM read the thinking switch and effort from chat_template_kwargs.
+_PI_CHAT_TEMPLATE_COMPAT = {
+    "thinkingFormat": "chat-template",
+    "chatTemplateKwargs": {
+        "enable_thinking": {"$var": "thinking.enabled"},
+        "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": True},
+    },
+}
+
+
 def _pi_config_value(value: str) -> str:
     """Pi resolves $NAME and !command in apiKey and header values; doubling $ keeps a literal value intact,
     and a leading ! is prefixed with $ so pi's $! escape makes it literal instead of a shell command."""
@@ -118,9 +135,16 @@ def _pi_model_entry(
     max_tokens: Optional[int],
     request_body: Optional[dict],
     *,
+    thinking_format: Optional[str] = None,
     should_warn: bool = True,
 ) -> dict:
     entry = {"id": model["id"]}
+    if thinking_format:
+        # Pi offers thinking levels (and Shift+Tab cycling) only for a reasoning model.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = _PI_THINKING_LEVEL_MAP
+        if thinking_format == "chat-template":
+            entry["compat"] = _PI_CHAT_TEMPLATE_COMPAT
     window = model.get("context_length") or model.get("max_context_length")
     if window:
         window = int(window)
@@ -148,6 +172,7 @@ def write_pi_config(
     request_body: Optional[dict] = None,
     headers: Optional[dict] = None,
     served_models: Optional[list] = None,
+    thinking_format: Optional[str] = None,
 ) -> None:
     config = _read_json_object(path)
     if config is None:
@@ -171,7 +196,13 @@ def write_pi_config(
         "apiKey": _pi_config_value(key),
         **({"headers": _pi_header_values(headers)} if headers else {}),
         "models": [
-            _pi_model_entry(served, max_tokens, request_body, should_warn = served_id == model["id"])
+            _pi_model_entry(
+                served,
+                max_tokens,
+                request_body,
+                thinking_format = thinking_format,
+                should_warn = served_id == model["id"],
+            )
             for served_id, served in catalog.items()
         ],
     }
@@ -179,6 +210,16 @@ def write_pi_config(
     if json.dumps(config, sort_keys = True) != before:
         _write_private_json(path, config)
         typer.echo(f"Updated {path}")
+
+
+def write_pi_thinking_default(agent_dir: Path) -> None:
+    """Start the session at xhigh; a level saved in a persisted session stays."""
+    path = agent_dir / "settings.json"
+    settings = _read_json_object(path)
+    if settings is None or "defaultThinkingLevel" in settings:
+        return  # write_pi_user_resources already warned about an unparsable file
+    settings["defaultThinkingLevel"] = "xhigh"
+    _write_private_json(path, settings)
 
 
 _PI_COMPACTION_KEYS = ({"enabled", "reserveTokens"}, {"enabled", "reserveTokens", "modelOverrides"})
@@ -763,26 +804,35 @@ def pi(
             )
         return
     served_models = _get_served_models(target, key, entry["id"])
+    # Pi sets the thinking level itself where the server carries it, so /thinking and Shift+Tab
+    # work; auto leaves thinking to the server's template.
+    thinking_format = None
+    if reasoning != "auto":
+        if providers.get_has_template_kwargs(target.name):
+            thinking_format = "chat-template"
+        elif target.name == "openai":
+            thinking_format = "openai"
+    if thinking_format and not _agent_version_at_least("pi", _PI_SAMPLING_PARAMS_MIN_VERSION):
+        thinking_format = None
+    request_body = server_options.request_body()
+    thinking_flags = []
+    if thinking_format:
+        # A pinned effort would override the level pi picks.
+        request_body = server_options._replace(carried = frozenset(_SAMPLING_FIELDS)).request_body()
+        if reasoning == "off" or reasoning_effort == "none":
+            thinking_flags = ["--thinking", "off"]
+        elif reasoning_effort in _REASONING_EFFORTS:
+            thinking_flags = ["--thinking", reasoning_effort]
     # Pi starts on a saved default model, else a known provider's default, else the first available one, so pin our provider/model on the command line; the custom OpenAI-compatible endpoint itself is only configurable via ~/.pi/agent/models.json.
-    command = [
-        "pi",
+    sent_flags = [
         "--provider",
         _PI_PROVIDER,
         "--model",
         entry["id"],
+        *thinking_flags,
         *_yolo_command_flags("pi", yolo),
-        *_drop_overridden_args(
-            "pi",
-            ctx.args,
-            [
-                "--provider",
-                _PI_PROVIDER,
-                "--model",
-                entry["id"],
-                *_yolo_command_flags("pi", yolo),
-            ],
-        ),
     ]
+    command = ["pi", *sent_flags, *_drop_overridden_args("pi", ctx.args, sent_flags)]
     # --ignore-scripts matches Pi's documented install recipe (its README notes Pi needs no install scripts), so accepting the prompt skips dependency lifecycle scripts.
     with _session_config("pi", launch, persist = persist) as home:
         # Pi resolves its config dir from PI_CODING_AGENT_DIR first (getAgentDir() prefers it over $HOME/.pi/agent), so pin it at the session dir: an inherited PI_CODING_AGENT_DIR in the user's shell would otherwise send Pi to their real config and skip our provider/key. HOME is relocated too so any other ~/.pi paths stay in the session. The key rides in the config rather than the env.
@@ -793,12 +843,15 @@ def pi(
             entry,
             pi_agent_dir / "models.json",
             max_tokens = max_tokens,
-            request_body = server_options.request_body(),
+            request_body = request_body,
             headers = headers,
             served_models = served_models,
+            thinking_format = thinking_format,
         )
         write_pi_user_resources(pi_agent_dir, home, skills = skills)
         write_pi_compaction(pi_agent_dir, entry, compact_at, served_models)
+        if thinking_format:
+            write_pi_thinking_default(pi_agent_dir)
         # Pi's built-in MCP (since 0.99.0) reads <agentDir>/mcp.json (as does the user's pi-mcp-adapter);
         # HOME and PI_CODING_AGENT_DIR are already the session's, so this file replaces the
         # user's own servers for the session. Without MCP flags it is removed again, so a
