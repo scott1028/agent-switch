@@ -68,7 +68,6 @@ from agent_switch.core.options import (
     _TOP_P_OPTION,
     _URL_OPTION,
     _YOLO_OPTION,
-    _check_compact_at,
     _drop_overridden_args,
     _fail,
     _refuse_local_only,
@@ -93,6 +92,10 @@ _CODEX_ENV_KEY = "AGENT_SWITCH_AUTH_TOKEN"
 
 # Codex treats an SSE stream with no bytes for this long as lost, cancels it and reconnects. Its default is 300000 (5 minutes), measured against the WHOLE quiet period, and a local server may send nothing at all while it processes the prompt. A local CPU host chews through a prompt at low tens of tokens a second and Codex's own preamble is several thousand tokens before the user has typed anything: 16.1 tok/s measured on a 2-core box means ~460s of silence for a ~7300-token first turn, so the default trips before the first token exists. The reconnect is worse than the wait, because the server hands the retry a different parallel slot whose KV cache shares no prefix, so each attempt restarts prompt processing from zero and the five retries can never converge. Observed as a request completing in exactly 300056ms with `Reconnecting... 1/5` and no turn ever finishing. 20 minutes here, sized to be longer than a slow local first turn rather than to any server-side budget: nothing here bounds generation, and a genuinely dead stream is still caught, just later.
 _CODEX_STREAM_IDLE_TIMEOUT_MS = 1_200_000
+
+
+# Codex clamps auto_compact_token_limit to 90% of the window (codex-rs protocol/src/openai_models.rs auto_compact_token_limit).
+_CODEX_COMPACT_CEILING = 0.9
 
 
 _CODEX_SUBAGENT_MCP_MODULE = "agent_switch.codex_subagent_mcp"
@@ -769,7 +772,12 @@ def codex(
         target = target,
         needs = ("/v1/responses",),
     )
-    _check_compact_at(compact_at, entry)
+    if compact_at is not None and compact_at > _CODEX_COMPACT_CEILING:
+        typer.echo(
+            f"Warning: Codex caps auto-compaction at 90% of the window, so --compact-at "
+            f"{compact_at} acts as {_CODEX_COMPACT_CEILING}.",
+            err = True,
+        )
     if as_subagent:
         with _session_config("codex-subagent", launch, persist = persist) as home:
             bridge_config = write_codex_subagent_bridge(
@@ -801,7 +809,7 @@ def codex(
                 install_hint = install_hint,
             )
         return
-    served_models = _get_served_models(target, key, max_seq_length)
+    served_models = _get_served_models(target, key, entry["id"])
     with _session_config("codex", launch, persist = persist) as home:
         write_codex_config(
             base, entry, home, codex_effort, headers, compact_at, mcp_servers, served_models

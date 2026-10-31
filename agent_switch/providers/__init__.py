@@ -30,9 +30,9 @@ _MODULES = {
 _DETECT_ORDER = ("ollama", "lmstudio", "llamacpp", "vllm")
 # Placeholder for servers without auth: every agent refuses an empty key.
 NO_KEY = "agent-switch"
-# Default agent window when the server reports none, and cap when it reports more.
+# Agent window when the server reports none.
 DEFAULT_CONTEXT_LENGTH = 250_000
-# Keep the server window as is, or leave it unset so the agent uses its default.
+# The --context-length default: keep the server window as is.
 SERVER_CONTEXT_LENGTH = -1
 _NEEDS = {
     "/v1/messages": "an Anthropic-compatible /v1/messages endpoint, which Claude Code needs",
@@ -102,10 +102,6 @@ def _find(entries: list, wanted: str, module) -> Optional[dict]:
     return next((entry for entry in entries if _same_model(entry, wanted, module)), None)
 
 
-def _cap_window(window: Optional[int]) -> int:
-    return min(int(window), DEFAULT_CONTEXT_LENGTH) if window else DEFAULT_CONTEXT_LENGTH
-
-
 def connect(
     target: Target,
     api_key: Optional[str],
@@ -114,9 +110,8 @@ def connect(
     needs: tuple = (),
     allow_load: bool = True,
 ) -> tuple:
-    """(base, key, entry) for a target; entry is {"id", "context_length"}."""
-    keeps_server_window = context_length == SERVER_CONTEXT_LENGTH
-    if keeps_server_window:
+    """(base, key, entry) for a target; entry is {"id", "context_length"}, None when unreported."""
+    if context_length == SERVER_CONTEXT_LENGTH:
         context_length = None
     module = _MODULES[target.name]
     base, key, headers = target.base, api_key or None, target.headers
@@ -178,13 +173,8 @@ def connect(
                 f"{module.LABEL} serves {match['id']} with."
             )
         window = context_length
-    if not context_length and not keeps_server_window:
-        window = _cap_window(window)
-    if not window and not keeps_server_window:
-        raise ProviderError(
-            f"Couldn't find {match['id']}'s context length on {module.LABEL} at {base}. "
-            "Pass the server's real window with --context-length <tokens>."
-        )
+    # A model loaded at --context-length runs at it even when the server does not report it.
+    window = window or context_length
     for path in needs:
         if not endpoint_exists(base, path, key, headers):
             raise ProviderError(f"{module.LABEL} at {base} has no {_NEEDS.get(path, path)}.")
@@ -244,36 +234,27 @@ def connect_servers(
                 raise ProviderError(
                     f"{target.server} at {target.base} has no {_NEEDS.get(path, path)}."
                 )
-    keeps_server_window = context_length == SERVER_CONTEXT_LENGTH
     routes: dict = {}
     for target, key, entries in zip(targets, keys, listings):
         for listed in entries:
             window = listed.get("context_length")
-            if keeps_server_window:
-                window = int(window) if window else None
-            else:
-                window = _cap_window(window)
+            window = int(window) if window else DEFAULT_CONTEXT_LENGTH
             routes[f"{target.server}:{listed['id']}"] = (target, listed["id"], key, window)
     # A model connect just loaded is not in the listing taken above.
     public_id = f"{selected.server}:{entry['id']}"
-    routes[public_id] = (selected, entry["id"], keys[index], entry["context_length"])
+    window = entry["context_length"] or DEFAULT_CONTEXT_LENGTH
+    routes[public_id] = (selected, entry["id"], keys[index], window)
     entry["id"] = public_id
     return selected, entry, routes
 
 
-def get_served_models(
-    target: Target, api_key: Optional[str], context_length: Optional[int] = None
-) -> list:
-    """Listed models with agent windows in server order."""
+def get_served_models(target: Target, api_key: Optional[str]) -> list:
+    """Listed models with server windows in server order; None when unreported."""
     entries = _MODULES[target.name].models(target.base, api_key or None, target.headers)
     served_models = []
     for entry in entries:
         window = entry.get("context_length")
-        if context_length == SERVER_CONTEXT_LENGTH:
-            window = int(window) if window else None
-        else:
-            window = _cap_window(window)
-        served_models.append({"id": entry["id"], "context_length": window})
+        served_models.append({"id": entry["id"], "context_length": int(window) if window else None})
     return served_models
 
 

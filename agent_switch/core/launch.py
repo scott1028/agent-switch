@@ -357,6 +357,18 @@ def _warn_unsent_pins(server_options: ServerOptions) -> None:
         typer.echo(f"Warning: this agent can't send {', '.join(unsent)} itself, so it is ignored.", err = True)
 
 
+def _fill_unreported_window(entry: dict) -> None:
+    """Every agent needs a window, so an unreported one falls back to the default."""
+    if entry["context_length"]:
+        return
+    entry["context_length"] = providers.DEFAULT_CONTEXT_LENGTH
+    typer.echo(
+        f"Warning: the server did not report {entry['id']}'s context length; using "
+        f"{providers.DEFAULT_CONTEXT_LENGTH:,} tokens. Pass --context-length <tokens> to set it.",
+        err = True,
+    )
+
+
 def _connect(
     model: Optional[str],
     load: LoadOptions = LoadOptions(),
@@ -392,6 +404,7 @@ def _connect(
         for upstream in target.upstreams:
             if upstream.is_given_key:
                 _remember_key(cache, upstream.base, upstream.api_key)
+        _fill_unreported_window(entry)
         return base, token, entry
     key = target.api_key
     try:
@@ -402,24 +415,41 @@ def _connect(
         _fail(str(exc))
     if target.is_given_key:
         _remember_key(cache, base, target.api_key)
+    _fill_unreported_window(entry)
     return base, key, entry
 
 
 def _get_served_models(
-    target: Target, key: Optional[str], context_length: Optional[int] = None
+    target: Target, key: Optional[str], model_id: str, *, should_warn: bool = True
 ) -> list:
+    """Listed models; unreported windows fall back to the default with one warning."""
     try:
         if not target.upstreams:
-            return providers.get_served_models(target, key, context_length)
-        # Several servers: each listing uses the key settled for it at resolve time, and every id
-        # gains its server prefix.
-        served_models = []
-        for upstream in target.upstreams:
-            for served in providers.get_served_models(upstream, upstream.api_key, context_length):
-                served_models.append({**served, "id": f"{upstream.server}:{served['id']}"})
-        return served_models
+            served_models = providers.get_served_models(target, key)
+        else:
+            # Several servers: each listing uses the key settled for it at resolve time, and
+            # every id gains its server prefix.
+            served_models = []
+            for upstream in target.upstreams:
+                for served in providers.get_served_models(upstream, upstream.api_key):
+                    served_models.append({**served, "id": f"{upstream.server}:{served['id']}"})
     except ProviderError as exc:
         _fail(str(exc))
+    # The connected model (model_id) already warned in _connect.
+    unreported = [
+        served["id"]
+        for served in served_models
+        if not served["context_length"] and served["id"] != model_id
+    ]
+    for served in served_models:
+        served["context_length"] = served["context_length"] or providers.DEFAULT_CONTEXT_LENGTH
+    if unreported and should_warn:
+        typer.echo(
+            f"Warning: the server did not report a context length for {', '.join(unreported)}; "
+            f"using {providers.DEFAULT_CONTEXT_LENGTH:,} tokens for them.",
+            err = True,
+        )
+    return served_models
 
 
 def _run(

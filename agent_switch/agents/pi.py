@@ -63,7 +63,6 @@ from agent_switch.core.options import (
     _URL_OPTION,
     _YOLO_OPTION,
     _agent_output_limit,
-    _check_compact_at,
     _drop_overridden_args,
     _fail,
     _get_compaction_reserve,
@@ -723,7 +722,6 @@ def pi(
         server_options = server_options,
         target = target,
     )
-    _check_compact_at(compact_at, entry)
     if as_subagent:
         if compact_at is not None:
             typer.echo(
@@ -764,7 +762,7 @@ def pi(
                 clear_screen = True,
             )
         return
-    served_models = _get_served_models(target, key, max_seq_length)
+    served_models = _get_served_models(target, key, entry["id"])
     # Pi starts on a saved default model, else a known provider's default, else the first available one, so pin our provider/model on the command line; the custom OpenAI-compatible endpoint itself is only configurable via ~/.pi/agent/models.json.
     command = [
         "pi",

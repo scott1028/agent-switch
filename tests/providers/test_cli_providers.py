@@ -67,6 +67,66 @@ def test_context_length_below_server_sentinel_is_rejected(cli):
     assert "range" in result.output.lower()
 
 
+def _generic(server, models):
+    server.route("GET", "/v1/models", body = {"object": "list", "data": models})
+    server.route("POST", "/v1/messages", status = 400, body = {"error": "model is required"})
+
+
+def _opencode_models(tmp_path) -> dict:
+    config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
+    return config["provider"][opencode_agent._OPENCODE_PROVIDER]["models"]
+
+
+def _window_warnings(output: str) -> list:
+    return [line for line in output.splitlines() if "did not report" in line]
+
+
+def test_default_keeps_a_server_window_above_250000(cli, fake_server, tmp_path):
+    _generic(fake_server, [{"id": "big", "context_length": 1_048_576}])
+    result = cli("opencode", "--url", fake_server.base, "--no-launch")
+    assert result.exit_code == 0, result.output
+    assert _opencode_models(tmp_path)["big"]["limit"]["context"] == 1_048_576
+    assert _window_warnings(result.output) == []
+
+
+@pytest.mark.parametrize("extra", [[], ["--context-length", "-1"]])
+def test_unreported_windows_fall_back_to_250000_with_warnings(cli, fake_server, tmp_path, extra):
+    _generic(
+        fake_server,
+        [{"id": "m"}, {"id": "a"}, {"id": "b", "context_length": 8192}, {"id": "c"}],
+    )
+    result = cli("opencode", "--url", fake_server.base, "--model", "m", "--no-launch", *extra)
+    assert result.exit_code == 0, result.output
+    models = _opencode_models(tmp_path)
+    assert {name: models[name]["limit"]["context"] for name in "mabc"} == {
+        "m": 250_000, "a": 250_000, "b": 8192, "c": 250_000,
+    }
+    # The connected model gets its own line; every other listed model shares one.
+    assert _window_warnings(result.output) == [
+        "Warning: the server did not report m's context length; using 250,000 tokens. "
+        "Pass --context-length <tokens> to set it.",
+        "Warning: the server did not report a context length for a, c; using 250,000 tokens for them.",
+    ]
+
+
+def test_claude_warns_only_for_its_own_unreported_window(cli, fake_server):
+    # Claude reads only the ids of the other listed models; their windows never reach it.
+    _generic(fake_server, [{"id": "m", "context_length": 8192}, {"id": "other"}])
+    result = cli("claude", "--url", fake_server.base, "--model", "m", "--no-launch")
+    assert result.exit_code == 0, result.output
+    assert _window_warnings(result.output) == []
+
+
+@pytest.mark.parametrize("url", [True, False])
+def test_context_length_zero_is_rejected(cli, fake_server, url):
+    _generic(fake_server, [{"id": "m", "context_length": 8192}])
+    extra = ["--url", fake_server.base] if url else []
+    result = cli("opencode", "--context-length", "0", "--no-launch", *extra)
+    assert result.exit_code != 0
+    # Rich wraps the error inside a box; fold its borders and line breaks away.
+    assert "0 is not a window" in " ".join(result.output.replace("│", " ").split())
+
+
 def test_claude_against_ollama(cli, fake_server):
     _ollama(fake_server)
     result = cli("claude", "--url", fake_server.base, "--no-launch")

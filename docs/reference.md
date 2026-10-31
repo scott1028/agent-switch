@@ -232,10 +232,9 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 
 - The context window comes from the server: Ollama `/api/ps`, LM Studio's loaded instance,
   llama-server `meta.n_ctx`, or vLLM `max_model_len`.
-- It is capped at 250,000 tokens unless you give `--context-length`. A server that reports no window
-  gets 250,000 tokens.
-- `--context-length -1` uses the server's window as is, uncapped. If the server reports none,
-  agent-switch sets no window and the agent uses its own default.
+- By default (`--context-length -1`) the agent gets the server's window as is, uncapped. A server
+  that reports no window gets 250,000 tokens, and agent-switch warns at startup.
+- `--context-length <tokens>` sets the window yourself. `0` is refused.
 - agent-switch never starts a model server. By default it may load the `--model` you name into a
   server that is already running. `--no-model-load` makes it a pure client that never loads,
   reloads or unloads anything; the model must already be loaded.
@@ -244,7 +243,8 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
   each agent's own behavior.
   - Claude Code applies the fraction to its own effective window (the window minus its output
     reserve), so it can only start compaction earlier than its built-in trigger, never later.
-  - Codex caps it at 0.9 of the window, so a value above 0.9 acts as 0.9.
+    agent-switch warns about this whenever you pass `--compact-at` to Claude Code.
+  - Codex caps it at 0.9 of the window, so a value above 0.9 acts as 0.9, and agent-switch warns.
   - DeepSeek Harness applies it only to its headless profile (`--profile headless`). Its web profile
     ignores it, and agent-switch warns before starting it.
 

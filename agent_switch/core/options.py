@@ -128,11 +128,19 @@ _MODEL_OPTION = typer.Option(
 )
 
 
+def _check_context_length(value: int) -> int:
+    if value == 0:
+        raise typer.BadParameter("0 is not a window; pass -1 for the server's window or a token count.")
+    return value
+
+
+# -1 (the default) keeps the server's window, or 250,000 when it reports none.
 _CONTEXT_OPTION = typer.Option(
-    0,
+    -1,
     "--max-seq-length",
     "--context-length",
     min = -1,
+    callback = _check_context_length,
     rich_help_panel = _PANEL_MODEL,
     show_default = False,
     help = "Set the context window in tokens; see Context window.",
@@ -537,7 +545,7 @@ def _drop_overridden_args(agent: str, agent_args: list, sent: list) -> list:
 class LoadOptions(NamedTuple):
     """Model-load knobs used when --model triggers a load on the server."""
 
-    max_seq_length: int = 0
+    max_seq_length: int = -1
     # --no-model-load: never load, reload or unload a model on the server.
     allow_load: bool = True
 
@@ -644,7 +652,7 @@ def _fail(message: str) -> NoReturn:
 def _refuse_local_only(
     *,
     model: Optional[str] = None,
-    max_seq_length: int = 0,
+    max_seq_length: int = -1,
     max_tokens: Optional[int] = None,
     reasoning: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -673,7 +681,7 @@ def _refuse_local_only(
     env_keys = os.environ.get("AGENT_SWITCH_API_KEY", "").split()
     given = (
         ("--model", model is not None),
-        ("--context-length", max_seq_length != 0),
+        ("--context-length", max_seq_length != -1),
         ("--max-tokens", max_tokens is not None),
         ("--reasoning", reasoning is not None),
         ("--reasoning-effort", reasoning_effort is not None),
@@ -721,15 +729,6 @@ def _is_hub_model_id(value: object) -> bool:
     except OSError:
         return False
     return True
-
-
-def _check_compact_at(compact_at: Optional[float], model: dict) -> None:
-    """--compact-at scales off the server-reported window; without one there is nothing to scale."""
-    if compact_at is not None and not (model.get("context_length") or model.get("max_context_length")):
-        typer.echo(
-            "Warning: the server did not report the model's context length, so --compact-at is ignored.",
-            err = True,
-        )
 
 
 def opencode_output_limit(window: int, max_tokens: Optional[int] = None) -> int:

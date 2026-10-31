@@ -66,7 +66,6 @@ from agent_switch.core.options import (
     _TOP_P_OPTION,
     _URL_OPTION,
     _YOLO_OPTION,
-    _check_compact_at,
     _drop_overridden_args,
     _fail,
     _refuse_local_only,
@@ -582,7 +581,12 @@ def claude(
         needs = ("/v1/messages",),
     )
     model_id = entry["id"]
-    _check_compact_at(compact_at, entry)
+    if compact_at is not None:
+        typer.echo(
+            "Warning: Claude Code uses --compact-at only to compact earlier than its built-in "
+            "trigger, never later.",
+            err = True,
+        )
     if as_subagent:
         window = entry.get("context_length") or entry.get("max_context_length")
         server_env = {
@@ -623,7 +627,8 @@ def claude(
             )
         return
 
-    served_models = _get_served_models(target, key, max_seq_length)
+    # Claude reads only the listed ids; every model shares the launch model's window.
+    served_models = _get_served_models(target, key, model_id, should_warn = False)
     env = _claude_local_env(base, key, entry, server_options.request_body(), headers, compact_at)
     # Claude Code auto-compacts against its native context window; the local env above supplies the loaded model's real window and a 90% threshold instead. --yolo (or its aliases) maps to Claude's own --dangerously-skip-permissions. IS_SANDBOX is left unset on purpose: Claude refuses bypass mode as root unless a sandbox is detected, and we do not want to falsely claim one on the user's host. claude keeps its history in ~/.claude/projects, which --settings/env never relocate, so a session already survives exit; resume it with `claude --continue` or `--resume <id>` passed through.
     with _session_config("claude", launch, persist = persist) as config:

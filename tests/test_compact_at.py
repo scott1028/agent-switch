@@ -12,7 +12,6 @@ from typer.testing import CliRunner
 
 import agent_switch.start as start
 from tests.cli_support import BASE, MODEL, _assert_env_set
-from agent_switch.core import options as core_options
 from agent_switch.agents import claude as claude_agent, codex as codex_agent, opencode as opencode_agent
 from tests.start_split import set_start_attr
 
@@ -29,6 +28,27 @@ def test_claude_compact_at_unset_keeps_90(fake_vllm):
     result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     _assert_env_set(result.output, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "90")
+
+
+_CLAUDE_CEILING_WARNING = (
+    "Warning: Claude Code uses --compact-at only to compact earlier than its built-in trigger, "
+    "never later."
+)
+
+
+@pytest.mark.parametrize("subagent", [[], ["--as-subagent"]])
+def test_claude_compact_at_warns_it_only_compacts_earlier(fake_vllm, subagent):
+    result = CliRunner().invoke(
+        start.start_app, ["claude", "--url", BASE, "--no-launch", "--compact-at", "0.85", *subagent]
+    )
+    assert result.exit_code == 0, result.output
+    assert _CLAUDE_CEILING_WARNING in result.stderr
+
+
+def test_claude_without_compact_at_has_no_ceiling_warning(fake_vllm):
+    result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert _CLAUDE_CEILING_WARNING not in result.stderr
 
 
 def _codex_profile(tmp_path) -> str:
@@ -52,6 +72,25 @@ def test_codex_compact_at_unset_omits_limit(fake_vllm, tmp_path):
     assert "model_auto_compact_token_limit" not in _codex_profile(tmp_path)
     catalog = json.loads((tmp_path / "agents" / "codex" / "model-catalog.json").read_text())
     assert "auto_compact_token_limit" not in catalog["models"][0]
+
+
+@pytest.mark.parametrize("subagent", [[], ["--as-subagent"]])
+def test_codex_compact_at_above_its_ceiling_warns(fake_vllm, subagent):
+    result = CliRunner().invoke(
+        start.start_app, ["codex", "--url", BASE, "--no-launch", "--compact-at", "0.95", *subagent]
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        "Warning: Codex caps auto-compaction at 90% of the window, so --compact-at 0.95 acts as 0.9."
+        in result.stderr
+    )
+
+
+@pytest.mark.parametrize("compact_at", [[], ["--compact-at", "0.9"]])
+def test_codex_compact_at_within_its_ceiling_does_not_warn(fake_vllm, compact_at):
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", *compact_at])
+    assert result.exit_code == 0, result.output
+    assert "caps auto-compaction" not in result.stderr
 
 
 def test_opencode_compact_at_scales_reserved(fake_vllm, tmp_path):
@@ -110,16 +149,6 @@ def test_compact_at_out_of_range_rejected(fake_vllm, value):
 def test_compact_at_range_accepted(fake_vllm, value):
     result = CliRunner().invoke(start.start_app, ["claude", "--url", BASE, "--no-launch", "--compact-at", value])
     assert result.exit_code == 0, result.output
-
-
-def test_check_compact_at_warns_without_a_window(capsys):
-    core_options._check_compact_at(0.85, {"id": "some-model"})
-    assert "--compact-at is ignored" in capsys.readouterr().err
-
-
-def test_check_compact_at_silent_with_a_window(capsys):
-    core_options._check_compact_at(0.85, {"id": "some-model", "context_length": 32768})
-    assert capsys.readouterr().err == ""
 
 
 def test_claude_local_env_pct_from_compact_at():

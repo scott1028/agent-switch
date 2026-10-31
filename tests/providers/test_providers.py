@@ -115,10 +115,10 @@ def test_vllm_uses_the_only_served_model_and_its_window(fake_server):
     assert entry == {"id": "Qwen/Qwen3-8B", "context_length": 40960}
 
 
-def test_vllm_caps_the_reported_window_at_250000(fake_server):
+def test_vllm_keeps_a_reported_window_above_250000(fake_server):
     _vllm(fake_server, 1_000_000)
     _, _, entry = providers.connect(Target("vllm", fake_server.base), None, None, None)
-    assert entry == {"id": "Qwen/Qwen3-8B", "context_length": 250000}
+    assert entry == {"id": "Qwen/Qwen3-8B", "context_length": 1_000_000}
 
 
 def test_vllm_server_window_stays_uncapped(fake_server):
@@ -141,10 +141,11 @@ def test_fixed_server_context_length_caps_but_cannot_exceed(fake_server):
         providers.connect(Target("vllm", fake_server.base), None, None, 65536)
 
 
-def test_generic_server_without_a_window_defaults_to_250000(fake_server):
+def test_generic_server_without_a_window_reports_none(fake_server):
+    # The 250,000 fallback and its warning live in launch._connect.
     fake_server.route("GET", "/v1/models", body = {"object": "list", "data": [{"id": "m"}]})
     _, _, entry = providers.connect(Target("openai", fake_server.base), None, None, None)
-    assert entry == {"id": "m", "context_length": 250000}
+    assert entry == {"id": "m", "context_length": None}
     _, _, entry = providers.connect(Target("openai", fake_server.base), None, None, 8192)
     assert entry == {"id": "m", "context_length": 8192}
 
@@ -161,7 +162,7 @@ def test_generic_server_reads_a_reported_window(fake_server):
     assert entry["context_length"] == 65536
 
 
-def test_get_served_models_keeps_listing_order_and_caps_windows(fake_server):
+def test_get_served_models_keeps_listing_order_and_server_windows(fake_server):
     fake_server.route(
         "GET",
         "/v1/models",
@@ -172,8 +173,8 @@ def test_get_served_models_keeps_listing_order_and_caps_windows(fake_server):
         ]},
     )
     assert providers.get_served_models(Target("openai", fake_server.base), None) == [
-        {"id": "large", "context_length": 250000},
-        {"id": "unknown", "context_length": 250000},
+        {"id": "large", "context_length": 1_000_000},
+        {"id": "unknown", "context_length": None},
         {"id": "small", "context_length": 8192},
     ]
 
@@ -188,7 +189,7 @@ def test_get_served_models_keeps_server_windows_uncapped(fake_server):
             {"id": "small", "context_length": 8192},
         ]},
     )
-    assert providers.get_served_models(Target("openai", fake_server.base), None, -1) == [
+    assert providers.get_served_models(Target("openai", fake_server.base), None) == [
         {"id": "large", "context_length": 1_000_000},
         {"id": "unknown", "context_length": None},
         {"id": "small", "context_length": 8192},
@@ -355,6 +356,25 @@ def test_ollama_nothing_loaded_loads_the_first_listed_model(fake_server):
     assert entry == {"id": "smollm2:135m", "context_length": 4096}
 
 
+def test_ollama_alias_keeps_the_requested_window_when_ps_omits_it(fake_server):
+    alias = "agent-switch/smollm2-135m-ctx8192:latest"
+    state = {"ps": []}
+
+    def ps(_):
+        return 200, {"models": [{"name": name, "model": name} for name in state["ps"]]}
+
+    def generate(_):
+        state["ps"] = [alias]
+        return 200, {"done": True}
+
+    _ollama(fake_server)
+    fake_server.route("GET", "/api/ps", ps)
+    fake_server.route("POST", "/api/create", body = {"status": "success"})
+    fake_server.route("POST", "/api/generate", generate)
+    _, _, entry = providers.connect(Target("ollama", fake_server.base), None, "smollm2:135m", 8192)
+    assert entry == {"id": alias, "context_length": 8192}
+
+
 # ── connect: LM Studio ──
 
 
@@ -380,6 +400,23 @@ def test_lmstudio_loads_with_the_requested_context(fake_server):
     def load(payload):
         assert payload == {"model": "qwen/qwen3-8b", "context_length": 32768}
         state["instances"] = [{"id": "qwen/qwen3-8b", "config": {"context_length": 32768}}]
+        return 200, {"instance_id": "qwen/qwen3-8b", "status": "loaded"}
+
+    fake_server.route("GET", "/api/v1/models", models)
+    fake_server.route("GET", "/v1/models", body = {"object": "list", "data": [{"id": "qwen/qwen3-8b"}]})
+    fake_server.route("POST", "/api/v1/models/load", load)
+    _, _, entry = providers.connect(Target("lmstudio", fake_server.base), None, "qwen/qwen3-8b", 32768)
+    assert entry == {"id": "qwen/qwen3-8b", "context_length": 32768}
+
+
+def test_lmstudio_keeps_the_requested_window_when_the_instance_omits_it(fake_server):
+    state = {"instances": []}
+
+    def models(_):
+        return 200, {"models": [{"type": "llm", "key": "qwen/qwen3-8b", "loaded_instances": state["instances"]}]}
+
+    def load(_):
+        state["instances"] = [{"id": "qwen/qwen3-8b", "config": {}}]
         return 200, {"instance_id": "qwen/qwen3-8b", "status": "loaded"}
 
     fake_server.route("GET", "/api/v1/models", models)
@@ -560,7 +597,7 @@ def test_connect_servers_a_named_prefix_selects_that_server(fake_server_pair):
     targets = _two_servers(*fake_server_pair)
     selected, entry, routes = providers.connect_servers(targets, [None, None], "b:qwen3", None)
     assert selected == targets[1]
-    assert entry == {"id": "b:qwen3", "context_length": 250000}
+    assert entry == {"id": "b:qwen3", "context_length": None}
     assert routes["b:qwen3"] == (targets[1], "qwen3", None, 250000)
 
 
@@ -569,7 +606,7 @@ def test_connect_servers_a_colon_id_survives_the_server_prefix(fake_server_pair)
     targets = _two_servers(*fake_server_pair, a_ids = ("qwen3:8b",), b_ids = ("other",))
     selected, entry, _routes = providers.connect_servers(targets, [None, None], "a:qwen3:8b", None)
     assert selected == targets[0]
-    assert entry == {"id": "a:qwen3:8b", "context_length": 250000}
+    assert entry == {"id": "a:qwen3:8b", "context_length": None}
 
 
 def test_connect_servers_a_colon_id_without_a_named_server_stays_whole(fake_server_pair):
@@ -577,7 +614,7 @@ def test_connect_servers_a_colon_id_without_a_named_server_stays_whole(fake_serv
     targets = _two_servers(*fake_server_pair, a_ids = ("qwen3:8b",), b_ids = ("other",))
     selected, entry, _routes = providers.connect_servers(targets, [None, None], "qwen3:8b", None)
     assert selected == targets[0]
-    assert entry == {"id": "a:qwen3:8b", "context_length": 250000}
+    assert entry == {"id": "a:qwen3:8b", "context_length": None}
 
 
 def test_connect_servers_an_ambiguous_model_lists_the_candidates(fake_server_pair):
@@ -597,7 +634,7 @@ def test_connect_servers_without_a_model_use_the_first_server(fake_server_pair):
     targets = _two_servers(*fake_server_pair)
     selected, entry, routes = providers.connect_servers(targets, [None, None], None, None)
     assert selected == targets[0]
-    assert entry == {"id": "a:qwen3", "context_length": 250000}
+    assert entry == {"id": "a:qwen3", "context_length": None}
     assert list(routes) == ["a:qwen3", "b:qwen3"]
 
 
@@ -608,8 +645,8 @@ def test_connect_servers_routes_keep_each_server_key_and_window(fake_server_pair
     targets = (Target("openai", a.base, server = "a"), Target("openai", b.base, server = "b"))
     _selected, _entry, routes = providers.connect_servers(targets, ["key-a", "key-b"], None, None)
     assert routes["a:qwen3"] == (targets[0], "qwen3", "key-a", 8192)
-    # The same cap the single-server listing uses.
-    assert routes["b:qwen3"] == (targets[1], "qwen3", "key-b", 250000)
+    # Uncapped, as the single-server listing.
+    assert routes["b:qwen3"] == (targets[1], "qwen3", "key-b", 1_000_000)
     _selected, _entry, routes = providers.connect_servers(targets, ["key-a", "key-b"], None, -1)
     assert routes["b:qwen3"][3] == 1_000_000
 

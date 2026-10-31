@@ -69,7 +69,6 @@ from agent_switch.core.options import (
     _URL_OPTION,
     _YOLO_OPTION,
     _agent_output_limit,
-    _check_compact_at,
     _fail,
     _get_compaction_reserve,
     _refuse_local_only,
@@ -787,8 +786,7 @@ def opencode(
         server_options = server_options,
         target = target,
     )
-    served_models = _get_served_models(target, key, max_seq_length)
-    _check_compact_at(compact_at, entry)
+    served_models = _get_served_models(target, key, entry["id"])
     if opencode_v2:
         typer.echo(
             f"OpenCode V2 provider policies must allow '{_OPENCODE_PROVIDER}'.",

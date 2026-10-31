@@ -71,7 +71,6 @@ from agent_switch.core.options import (
     _URL_OPTION,
     _YOLO_OPTION,
     _agent_output_limit,
-    _check_compact_at,
     _fail,
     _refuse_local_only,
     opencode_output_limit,
@@ -1041,8 +1040,7 @@ def dsh(
         server_options = server_options,
         target = target,
     )
-    _check_compact_at(compact_at, entry)
-    served_models = _get_served_models(target, key, max_seq_length)
+    served_models = _get_served_models(target, key, entry["id"])
     with _session_config(_DSH_TUI_AGENT if is_tui else "dsh", launch, persist = persist) as home:
         if is_tui:
             # Recheck the real home: an unwritable agents dir falls back to the system temp dir.
