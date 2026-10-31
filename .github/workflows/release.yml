@@ -102,7 +102,9 @@ jobs:
           PIP_CONSTRAINT: ${{ runner.temp }}/constraints.txt
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          uvx --from python-appimage==1.4.6 python-appimage build app \
+          # Pin appimagetool: its rolling "continuous" build rejects the base image's 0700
+          # directories since 2026-10-31 (AppImage/appimagetool#135, #139).
+          uvx --from python-appimage==1.4.6 python-appimage -a 1.9.1 build app \
             -b "$RUNNER_TEMP"/base/*.AppImage "$RUNNER_TEMP/agent-switch"
           appimage="agent-switch-${RELEASE_TAG#v}-$(uname -m).AppImage"
           mv "agent-switch-$(uname -m).AppImage" "$appimage"
