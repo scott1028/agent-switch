@@ -54,6 +54,7 @@ from agent_switch.core.options import (
     _MODEL_OPTION,
     _PERSIST_OPTION,
     _PRESENCE_PENALTY_OPTION,
+    _PROJECT_PLANS_OPTION,
     _PROVIDER_OPTION,
     _REASONING_EFFORT_OPTION,
     _REASONING_OPTION,
@@ -122,10 +123,15 @@ _CLAUDE_ENV_UNSET = (
 _DYNAMIC_SECTIONS_FLAG = "--exclude-dynamic-system-prompt-sections"
 
 
+# Claude resolves plansDirectory against the project root.
+_CLAUDE_PLANS_DIRECTORY = ".tmp"
+
+
 def _claude_settings_overlay(
     model_id: str,
     local_env: Optional[dict] = None,
     served_model_ids: Optional[list] = None,
+    plans_directory: Optional[str] = None,
 ) -> str:
     # Command-tier pins beat user/project settings, which Claude applies after the process env.
     settings_env = {name: "" for name in _CLAUDE_ENV_UNSET}
@@ -146,6 +152,7 @@ def _claude_settings_overlay(
                 model_id,
                 *(served_id for served_id in served_model_ids or [] if served_id != model_id),
             ],
+            **({"plansDirectory": plans_directory} if plans_directory else {}),
         }
     )
 
@@ -155,8 +162,9 @@ def _write_claude_settings(
     model_id: str,
     local_env: dict,
     served_model_ids: Optional[list] = None,
+    plans_directory: Optional[str] = None,
 ) -> Path:
-    overlay = _claude_settings_overlay(model_id, local_env, served_model_ids)
+    overlay = _claude_settings_overlay(model_id, local_env, served_model_ids, plans_directory)
     digest = hashlib.sha256(overlay.encode("utf-8")).hexdigest()[:16]
     settings = path / f"settings-{digest}.json"
     _write_private_text(settings, overlay)
@@ -453,6 +461,16 @@ def _get_claude_skill_flags(config: Path, skills: Optional[dict]) -> list:
     return [f"--add-dir={_agent_config_path(directory, ['claude'])}"]
 
 
+def _get_claude_plans_flags(config: Path, project_plans: bool) -> list:
+    # For launches without the local overlay; it goes before forwarded args so a forwarded
+    # --settings still wins (claude keeps only the last one).
+    if not project_plans:
+        return []
+    settings = config / "plans-settings.json"
+    _write_private_json(settings, {"plansDirectory": _CLAUDE_PLANS_DIRECTORY})
+    return [f"--settings={_agent_config_path(settings, ['claude'])}"]
+
+
 def claude(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
@@ -484,6 +502,7 @@ def claude(
     mcp_env: Optional[list[str]] = _MCP_ENV_OPTION,
     skill: Optional[list[str]] = _SKILL_OPTION,
     skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
+    project_plans: bool = _PROJECT_PLANS_OPTION,
 ):
     """Point Claude Code at a local model server and start it."""
     # Validate the MCP selection before _connect, so a registry error fails fast.
@@ -544,6 +563,7 @@ def claude(
             else:
                 mcp_config.unlink(missing_ok = True)
             session_flags.extend(_get_claude_skill_flags(config, skills))
+            session_flags.extend(_get_claude_plans_flags(config, project_plans))
             command = _agent_command(
                 alias,
                 "claude",
@@ -611,6 +631,7 @@ def claude(
                 _agent_config_path(plugin, ["claude"]),
                 # Before ctx.args: a forwarded `--` would turn later flags positional. The `=` form is used because --allowedTools is variadic, so a detached value swallows the first forwarded positional.
                 f"--allowedTools={_CLAUDE_SUBAGENT_TOOL},{_CLAUDE_SUBAGENT_PLAN_TOOL}",
+                *_get_claude_plans_flags(config, project_plans),
                 *_yolo_command_flags("claude", yolo),
                 *_drop_overridden_args("claude", ctx.args, _yolo_command_flags("claude", yolo)),
             ]
@@ -633,7 +654,11 @@ def claude(
     # Claude Code auto-compacts against its native context window; the local env above supplies the loaded model's real window and a 90% threshold instead. --yolo (or its aliases) maps to Claude's own --dangerously-skip-permissions. IS_SANDBOX is left unset on purpose: Claude refuses bypass mode as root unless a sandbox is detected, and we do not want to falsely claim one on the user's host. claude keeps its history in ~/.claude/projects, which --settings/env never relocate, so a session already survives exit; resume it with `claude --continue` or `--resume <id>` passed through.
     with _session_config("claude", launch, persist = persist) as config:
         settings = _write_claude_settings(
-            config, model_id, env, [served["id"] for served in served_models]
+            config,
+            model_id,
+            env,
+            [served["id"] for served in served_models],
+            _CLAUDE_PLANS_DIRECTORY if project_plans else None,
         )
         session_flags = []
         mcp_config = config / "mcp.json"

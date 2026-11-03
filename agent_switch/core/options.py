@@ -310,6 +310,15 @@ _PERSIST_OPTION = typer.Option(
 )
 
 
+_PROJECT_PLANS_OPTION = typer.Option(
+    True,
+    "--project-plans/--no-project-plans",
+    show_default = False,
+    rich_help_panel = _PANEL_SESSION,
+    help = "Save plans in <project>/.tmp.",
+)
+
+
 _AS_SUBAGENT_OPTION = typer.Option(
     False,
     "--as-subagent",

@@ -228,6 +228,19 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 - claude and opencode keep sessions in your own stores (`~/.claude`, `~/.local/share/opencode`), so
   they can always resume.
 
+### Plan files
+
+Plan mode in Claude Code writes the plan to a file. `agent-switch claude` keeps that file with the
+project: it goes to `<project-root>/.tmp/` instead of `~/.claude/plans/`. Add `.tmp/` to the
+project's `.gitignore` if git should not see the plans.
+
+- agent-switch passes `{"plansDirectory": ".tmp"}` in a session `--settings` file, which overrides
+  a `plansDirectory` in the project's `.claude/settings.json`.
+- claude keeps only the last `--settings`. In native and `--as-subagent` launches, a `--settings`
+  after `--` replaces this file; with a local model server, the session overlay carries it and
+  stays last.
+- `--no-project-plans` keeps claude's default, `~/.claude/plans/`.
+
 ### Context and compaction
 
 - The context window comes from the server: Ollama `/api/ps`, LM Studio's loaded instance,
@@ -273,7 +286,7 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 Without `--url` or `--provider`, the agent starts natively: it keeps its own model, login and
 config, and agent-switch writes nothing into the agent's own config.
 
-- Only the shared flags apply: the MCP flags and `--yolo`.
+- Only the shared flags apply: the MCP flags, `--yolo` and claude's `--project-plans`.
 - Flags that only make sense with a local model server fail with "needs --url or --provider":
   `--model` and a positional model, `--context-length`, `--max-tokens`, `--reasoning`,
   `--reasoning-effort`, `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`,

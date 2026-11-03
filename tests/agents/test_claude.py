@@ -410,6 +410,7 @@ def test_connect_claude_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path):
         "--plugin-dir",
         str(plugin),
         f"--allowedTools={claude_agent._CLAUDE_SUBAGENT_TOOL},{claude_agent._CLAUDE_SUBAGENT_PLAN_TOOL}",
+        f"--settings={plugin.parent / 'plans-settings.json'}",
         "hello",
     ]
     assert "--model" not in command
@@ -891,12 +892,13 @@ def _native_no_connect(monkeypatch):
     )
 
 
-def test_native_claude_bare_adds_nothing(fake_vllm, monkeypatch):
+def test_native_claude_bare_adds_only_plans_settings(fake_vllm, tmp_path, monkeypatch):
     _native_no_connect(monkeypatch)
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 0, result.output
     assert "runs with its own model, login and config" in result.output
-    assert _launch_command(result.output) == ["claude"]
+    plans = tmp_path / "agents" / "claude-native" / "plans-settings.json"
+    assert _launch_command(result.output) == ["claude", f"--settings={plans}"]
     assert "ANTHROPIC" not in result.output
 
 
@@ -908,7 +910,10 @@ def test_native_claude_adds_mcp_additively(fake_vllm, tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     mcp_config = tmp_path / "agents" / "claude-native" / "mcp.json"
     # The `=` form before the passthrough args: --mcp-config is variadic in claude.
-    assert _launch_command(result.output) == ["claude", f"--mcp-config={mcp_config}"]
+    plans = mcp_config.parent / "plans-settings.json"
+    assert _launch_command(result.output) == [
+        "claude", f"--mcp-config={mcp_config}", f"--settings={plans}"
+    ]
     assert json.loads(mcp_config.read_text()) == {
         "mcpServers": {
             "ev": {"type": "stdio", "command": "npx", "args": ["everything"], "env": {}}
@@ -916,14 +921,15 @@ def test_native_claude_adds_mcp_additively(fake_vllm, tmp_path, monkeypatch):
     }
 
 
-def test_native_claude_yolo_and_passthrough(fake_vllm, monkeypatch):
+def test_native_claude_yolo_and_passthrough(fake_vllm, tmp_path, monkeypatch):
     _native_no_connect(monkeypatch)
     result = CliRunner().invoke(
         start.start_app, ["claude", "--no-launch", "--yolo", "--", "--print", "hi"]
     )
     assert result.exit_code == 0, result.output
+    plans = tmp_path / "agents" / "claude-native" / "plans-settings.json"
     assert _launch_command(result.output) == [
-        "claude", "--dangerously-skip-permissions", "--print", "hi"
+        "claude", "--dangerously-skip-permissions", f"--settings={plans}", "--print", "hi"
     ]
 
 
@@ -1012,7 +1018,9 @@ def test_claude_skill_rerun_clears_entries_and_restores_command_and_env(fake_vll
     assert baseline.exit_code == 0, baseline.output
     assert not (session / "agent-switch").exists()
     if not is_routed:
-        assert _launch_command(baseline.output) == ["claude", "--print", "hello"]
+        assert _launch_command(baseline.output) == [
+            "claude", f"--settings={session / 'plans-settings.json'}", "--print", "hello"
+        ]
     first = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
     assert first.exit_code == 0, first.output
     root = session / "agent-switch" / ".claude" / "skills"
@@ -1042,7 +1050,8 @@ def test_native_claude_alias_carries_skill_flag(fake_vllm, tmp_path, monkeypatch
     added_dir = tmp_path / "agents" / "claude-native" / "agent-switch"
     assert _launch_command(result.output) == [
         "bash", "-ic", 'claude-personal "$@"', "agent-switch",
-        f"--add-dir={added_dir}", "--print", "hello",
+        f"--add-dir={added_dir}", f"--settings={added_dir.parent / 'plans-settings.json'}",
+        "--print", "hello",
     ]
     assert "Injected skills: shared." in result.output
 

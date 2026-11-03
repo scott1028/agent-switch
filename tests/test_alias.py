@@ -60,13 +60,21 @@ def _find_bash(monkeypatch):
     "name",
     ["claude-personal", "codex-personal", "opencode-laptop", "pi-personal"],
 )
-def test_alias_runs_its_agent_kind_natively(fake_vllm, monkeypatch, name):
+def test_alias_runs_its_agent_kind_natively(fake_vllm, tmp_path, monkeypatch, name):
     _alias_ok(monkeypatch)
     _native_no_connect(monkeypatch)
     result = CliRunner().invoke(start.start_app, [name, "--no-launch"])
     assert result.exit_code == 0, result.output
     assert f"{name} runs with its own model, login and config" in result.output
-    assert _launch_command(result.output) == ["bash", "-ic", f'{name} "$@"', "agent-switch"]
+    # Only claude gets the --project-plans settings file.
+    plans = (
+        [f"--settings={tmp_path / 'agents' / 'claude-native' / 'plans-settings.json'}"]
+        if name.startswith("claude")
+        else []
+    )
+    assert _launch_command(result.output) == [
+        "bash", "-ic", f'{name} "$@"', "agent-switch", *plans
+    ]
 
 
 def test_dsh_alias_keeps_the_dsh_kind(fake_vllm, monkeypatch):
@@ -125,6 +133,7 @@ def test_native_claude_alias_flags_ride_the_bash_args(fake_vllm, tmp_path, monke
         "agent-switch",
         "--dangerously-skip-permissions",
         f"--mcp-config={mcp_config}",
+        f"--settings={mcp_config.parent / 'plans-settings.json'}",
         "--print",
         "hi",
     ]
