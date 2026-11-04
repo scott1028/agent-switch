@@ -417,6 +417,17 @@ _COMPACT_AT_OPTION = typer.Option(
 )
 
 
+# None tells a flag the user gave from the default, which _get_compaction_keep fills in.
+_COMPACT_KEEP_OPTION = typer.Option(
+    None,
+    "--compact-keep",
+    min = 0.0,
+    max = 0.4,
+    rich_help_panel = _PANEL_SESSION,
+    help = "Window fraction to keep; default 0.2.",
+)
+
+
 _HEADER_NAME_TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")  # RFC 7230 tchar
 
 
@@ -672,6 +683,7 @@ def _refuse_local_only(
     repetition_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     compact_at: Optional[float] = None,
+    compact_keep: Optional[float] = None,
     api_key: Optional[list] = None,
     header: Optional[list] = None,
     model_load: bool = True,
@@ -701,6 +713,7 @@ def _refuse_local_only(
         ("--repetition-penalty", repetition_penalty is not None),
         ("--presence-penalty", presence_penalty is not None),
         ("--compact-at", compact_at is not None),
+        ("--compact-keep", compact_keep is not None),
         ("--api-key", bool(api_key) and api_key != env_keys),
         ("--header", bool(header)),
         ("--no-model-load", not model_load),
@@ -759,3 +772,24 @@ def _agent_output_limit(window: int, max_tokens: Optional[int]) -> int:
 
 def _get_compaction_reserve(window: int, ratio: float) -> int:
     return max(1, int(window * (1 - ratio)))
+
+
+def _get_compaction_keep(model: dict, ratio: Optional[float]) -> Optional[int]:
+    """Tokens to keep through compaction; None leaves the agent's own default in place."""
+    window = model.get("context_length") or model.get("max_context_length")
+    # An assumed window may be far larger than the real one, and an amount sized from it can
+    # leave Pi nothing to summarize when the server reports an overflow.
+    if not window or model.get("is_window_assumed"):
+        return None
+    return int(int(window) * (0.2 if ratio is None else ratio)) or None
+
+
+def _warn_compact_keep_ignored(models: list, compact_keep: Optional[float]) -> None:
+    """Name the models a --compact-keep ratio cannot reach; 0 writes nothing anyway."""
+    assumed = [model["id"] for model in models if model.get("is_window_assumed")]
+    if compact_keep and assumed:
+        typer.echo(
+            f"Warning: the server did not report a context length for {', '.join(assumed)}, "
+            "so --compact-keep is ignored for them.",
+            err = True,
+        )

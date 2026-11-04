@@ -35,6 +35,7 @@ from agent_switch.core.options import (
     _ALL_REQUEST_FIELDS,
     _AS_SUBAGENT_OPTION,
     _COMPACT_AT_OPTION,
+    _COMPACT_KEEP_OPTION,
     _CONTEXT_OPTION,
     _HEADER_OPTION,
     _KEY_OPTION,
@@ -68,8 +69,10 @@ from agent_switch.core.options import (
     _agent_output_limit,
     _drop_overridden_args,
     _fail,
+    _get_compaction_keep,
     _get_compaction_reserve,
     _refuse_local_only,
+    _warn_compact_keep_ignored,
     _yolo_command_flags,
     opencode_output_limit,
 )
@@ -222,7 +225,43 @@ def write_pi_thinking_default(agent_dir: Path) -> None:
     _write_private_json(path, settings)
 
 
-_PI_COMPACTION_KEYS = ({"enabled", "reserveTokens"}, {"enabled", "reserveTokens", "modelOverrides"})
+_PI_TOKEN_KEYS = {"reserveTokens", "keepRecentTokens"}
+_PI_COMPACTION_KEYS = {"enabled", "modelOverrides", *_PI_TOKEN_KEYS}
+
+
+def _get_pi_token_settings(
+    model: dict,
+    catalog: dict,
+    compact_at: Optional[float],
+    compact_keep: Optional[float],
+) -> dict:
+    """Pi's compaction token settings; empty when none applies."""
+    window = model.get("context_length") or model.get("max_context_length")
+    is_reserving = compact_at is not None and bool(window)
+    settings = {}
+    if is_reserving:
+        # Pi compacts once the context exceeds contextWindow - reserveTokens. The ordinary
+        # reserveTokens only fits the launch model, so every other served model gets a
+        # per-model override keyed "<provider>/<id>" (settings-manager.js
+        # getCompactionTokenSetting); a smaller-window model would otherwise go negative
+        # and compact from the very first token.
+        settings["reserveTokens"] = _get_compaction_reserve(int(window), compact_at)
+    overrides = {}
+    for served_id, served in catalog.items():
+        override = {}
+        served_window = served.get("context_length") or served.get("max_context_length")
+        if is_reserving and served_window and served_id != model["id"]:
+            override["reserveTokens"] = _get_compaction_reserve(int(served_window), compact_at)
+        # keepRecentTokens is override-only, even for the launch model: a model without a
+        # reported window must fall back to Pi's default, not inherit another model's amount.
+        keep_tokens = _get_compaction_keep(served, compact_keep)
+        if keep_tokens is not None:
+            override["keepRecentTokens"] = keep_tokens
+        if override:
+            overrides[f"{_PI_PROVIDER}/{served_id}"] = override
+    if overrides:
+        settings["modelOverrides"] = overrides
+    return settings
 
 
 def write_pi_compaction(
@@ -230,54 +269,42 @@ def write_pi_compaction(
     model: dict,
     compact_at: Optional[float],
     served_models: Optional[list] = None,
+    compact_keep: Optional[float] = None,
 ) -> None:
-    """Scale Pi's auto-compaction trigger to --compact-at in the session settings."""
+    """Scale Pi's auto-compaction to --compact-at and --compact-keep in the session settings."""
     path = agent_dir / "settings.json"
     settings = _read_json_object(path)
     if settings is None:
         return  # write_pi_user_resources already warned
-    window = model.get("context_length") or model.get("max_context_length")
+    catalog = {served["id"]: served for served in served_models or []}
+    catalog[model["id"]] = model
+    _warn_compact_keep_ignored(list(catalog.values()), compact_keep)
     before = json.dumps(settings, sort_keys = True)
-    if compact_at is not None and window:
-        # Pi compacts once the context exceeds contextWindow - reserveTokens. The ordinary
-        # reserveTokens only fits the launch model, so every other served model gets a
-        # per-model override keyed "<provider>/<id>" (settings-manager.js
-        # getCompactionTokenSetting); a smaller-window model would otherwise go negative
-        # and compact from the very first token.
-        compaction = {
-            "enabled": True,
-            "reserveTokens": _get_compaction_reserve(int(window), compact_at),
+    token_settings = _get_pi_token_settings(model, catalog, compact_at, compact_keep)
+    compaction = settings.get("compaction")
+    if token_settings:
+        # A boolean enabled may be the user's own Auto-compact choice from Pi's settings screen.
+        enabled = compaction.get("enabled") if isinstance(compaction, dict) else None
+        settings["compaction"] = {
+            "enabled": enabled if isinstance(enabled, bool) else True,
+            **token_settings,
         }
-        catalog = {served["id"]: served for served in served_models or []}
-        catalog[model["id"]] = model
-        overrides = {}
-        for served_id, served in catalog.items():
-            if served_id == model["id"]:
-                continue  # the ordinary reserveTokens already fits the launch model
-            served_window = served.get("context_length") or served.get("max_context_length")
-            if served_window:
-                overrides[f"{_PI_PROVIDER}/{served_id}"] = {
-                    "reserveTokens": _get_compaction_reserve(int(served_window), compact_at),
-                }
-        if overrides:
-            compaction["modelOverrides"] = overrides
-        settings["compaction"] = compaction
-    else:
-        # Undo a --compact-at block an earlier run left in a persisted session; compaction
-        # is not a key this session inherits from the user, so these exact shapes are ours.
-        compaction = settings.get("compaction")
-        if (
-            isinstance(compaction, dict)
-            and compaction.keys() in _PI_COMPACTION_KEYS
-            and compaction["enabled"] is True
-            and isinstance(compaction["reserveTokens"], int)
-            and all(
-                isinstance(entry, dict)
-                and entry.keys() == {"reserveTokens"}
-                and isinstance(entry["reserveTokens"], int)
-                for entry in compaction.get("modelOverrides", {}).values()
-            )
-        ):
+    elif (
+        # Undo what an earlier run left in a persisted session; compaction is not a key this
+        # session inherits from the user, so this exact shape is ours.
+        isinstance(compaction, dict)
+        and compaction.keys() <= _PI_COMPACTION_KEYS
+        and all(isinstance(compaction.get(key, 0), int) for key in _PI_TOKEN_KEYS)
+        and all(
+            isinstance(entry, dict)
+            and entry.keys() <= _PI_TOKEN_KEYS
+            and all(isinstance(count, int) for count in entry.values())
+            for entry in compaction.get("modelOverrides", {}).values()
+        )
+    ):
+        if compaction.get("enabled") is False:
+            settings["compaction"] = {"enabled": False}
+        else:
             settings.pop("compaction", None)
     if json.dumps(settings, sort_keys = True) != before:
         _write_private_json(path, settings)
@@ -619,6 +646,7 @@ def pi(
     repetition_penalty: Optional[float] = _REPETITION_PENALTY_OPTION,
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     compact_at: Optional[float] = _COMPACT_AT_OPTION,
+    compact_keep: Optional[float] = _COMPACT_KEEP_OPTION,
     model_load: bool = _MODEL_LOAD_OPTION,
     url: Optional[list[str]] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
@@ -663,6 +691,7 @@ def pi(
             repetition_penalty = repetition_penalty,
             presence_penalty = presence_penalty,
             compact_at = compact_at,
+            compact_keep = compact_keep,
             api_key = api_key,
             header = header,
             model_load = model_load,
@@ -769,6 +798,11 @@ def pi(
                 "Warning: --compact-at does not apply with --as-subagent for Pi; ignoring it.",
                 err = True,
             )
+        if compact_keep is not None:
+            typer.echo(
+                "Warning: --compact-keep does not apply with --as-subagent for Pi; ignoring it.",
+                err = True,
+            )
         extension = _agent_config_path(_PI_SUBAGENT_EXTENSION, ["pi"])
         with _session_config("pi-subagent", launch, persist = persist) as config:
             config_path = config / "subagent.json"
@@ -849,7 +883,7 @@ def pi(
             thinking_format = thinking_format,
         )
         write_pi_user_resources(pi_agent_dir, home, skills = skills)
-        write_pi_compaction(pi_agent_dir, entry, compact_at, served_models)
+        write_pi_compaction(pi_agent_dir, entry, compact_at, served_models, compact_keep)
         if thinking_format:
             write_pi_thinking_default(pi_agent_dir)
         # Pi's built-in MCP (since 0.99.0) reads <agentDir>/mcp.json (as does the user's pi-mcp-adapter);

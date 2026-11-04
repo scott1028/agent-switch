@@ -327,7 +327,11 @@ def test_write_opencode_config_fresh(tmp_path):
     # Provider filters belong to the launch-time inline overlay, not this config writer.
     assert "disabled_providers" not in config
     # Compaction buffer scaled to ~10% of the window (compact near 90%).
-    assert config["compaction"] == {"auto": True, "reserved": 131072 // 10}
+    assert config["compaction"] == {
+        "auto": True,
+        "reserved": 131072 // 10,
+        "preserve_recent_tokens": 26214,  # the --compact-keep default, 131072 * 0.2
+    }
 
 
 def test_write_opencode_config_lists_served_models_and_keeps_resolved_limit(tmp_path):
@@ -401,11 +405,23 @@ def test_opencode_compaction_reserved(window, expected_reserved, expected_compac
     assert window - reserved == expected_compacts_at
 
 
-def test_opencode_subagent_drops_the_compaction_a_normal_session_wrote(tmp_path):
+@pytest.mark.parametrize(
+    "compact_keep, preserve_recent_tokens",
+    [(None, 3_276), (0.3, 4_915)],
+)
+def test_opencode_subagent_drops_the_compaction_a_normal_session_wrote(
+    tmp_path, compact_keep, preserve_recent_tokens
+):
     path = tmp_path / "opencode.json"
     small = {**MODEL, "context_length": 16_384}
-    opencode_agent.write_opencode_config(BASE, "sk-test-abc", small, path)
-    assert json.loads(path.read_text())["compaction"] == {"auto": True, "reserved": 4_096}
+    opencode_agent.write_opencode_config(
+        BASE, "sk-test-abc", small, path, compact_keep = compact_keep
+    )
+    assert json.loads(path.read_text())["compaction"] == {
+        "auto": True,
+        "reserved": 4_096,
+        "preserve_recent_tokens": preserve_recent_tokens,
+    }
     opencode_agent.write_opencode_config(BASE, "sk-test-abc", small, path, as_subagent = True)
     assert "compaction" not in json.loads(path.read_text())
 

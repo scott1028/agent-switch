@@ -260,6 +260,24 @@ project's `.gitignore` if git should not see the plans.
   - Codex caps it at 0.9 of the window, so a value above 0.9 acts as 0.9, and agent-switch warns.
   - DeepSeek Harness applies it only to its headless profile (`--profile headless`). Its web profile
     ignores it, and agent-switch warns before starting it.
+- `--compact-keep 0.3` keeps the most recent 30% of the window beside the summary when OpenCode or
+  Pi compacts. Unset keeps 20%, so a 250,000-token window keeps 50,000 tokens and a 1,000,000-token
+  window keeps 200,000. The range is 0–0.4. `0` leaves the agent's own default (OpenCode 2.x 15,000
+  tokens, Pi 20,000). With `--as-subagent` the flag is ignored with a warning.
+  - A model whose window the server does not report gets no amount and uses the agent's own
+    default. A `--compact-keep` you passed is ignored for those models only, with a warning that
+    names them. OpenCode's amount is global, so only its launch model counts. `--context-length`
+    counts as a reported window.
+  - Pi keeps the original messages. OpenCode turns the kept part into text: tool output is cut to
+    1,250 characters, reasoning is dropped, and attachments keep only their names.
+  - Pi gets a separate amount for each served model with a reported window. The other models use
+    Pi's default. This needs Pi 0.86.0 or later; older versions ignore the amount.
+  - A `compaction.keepRecentTokens` in a project's `.pi/settings.json` has no effect on a model
+    that has an amount. Pass `--compact-keep 0` to let it apply.
+  - OpenCode's amount comes from the launch model's window, so switching to a smaller-window model
+    mid-session does not recalculate it. Compaction can then run often, so use a smaller
+    `--compact-keep` for such models.
+  - OpenCode 1.x is also limited by `tail_turns` if you set it.
 
 ### Reasoning and sampling
 
@@ -290,8 +308,8 @@ config, and agent-switch writes nothing into the agent's own config.
 - Flags that only make sense with a local model server fail with "needs --url or --provider":
   `--model` and a positional model, `--context-length`, `--max-tokens`, `--reasoning`,
   `--reasoning-effort`, `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty`,
-  `--presence-penalty`, `--compact-at`, `--api-key`, `--header`, `--no-model-load`, `--as-subagent`,
-  `--persist`/`--no-persist`.
+  `--presence-penalty`, `--compact-at`, `--compact-keep`, `--api-key`, `--header`,
+  `--no-model-load`, `--as-subagent`, `--persist`/`--no-persist`.
 - Arguments after `--` still reach the agent unchanged.
 
 ```sh

@@ -37,6 +37,7 @@ from agent_switch.core.options import (
     _ALL_REQUEST_FIELDS,
     _AS_SUBAGENT_OPTION,
     _COMPACT_AT_OPTION,
+    _COMPACT_KEEP_OPTION,
     _CONTEXT_OPTION,
     _HEADER_OPTION,
     _KEY_OPTION,
@@ -70,8 +71,10 @@ from agent_switch.core.options import (
     _YOLO_OPTION,
     _agent_output_limit,
     _fail,
+    _get_compaction_keep,
     _get_compaction_reserve,
     _refuse_local_only,
+    _warn_compact_keep_ignored,
     opencode_output_limit,
 )
 from agent_switch.core.platform import _wsl_windows_executable
@@ -532,6 +535,7 @@ def write_opencode_config(
     request_body: Optional[dict] = None,
     headers: Optional[dict] = None,
     compact_at: Optional[float] = None,
+    compact_keep: Optional[float] = None,
     mcp_servers: Optional[dict] = None,
     served_models: Optional[list] = None,
     v2: bool = False,
@@ -554,6 +558,9 @@ def write_opencode_config(
         reserved = opencode_compaction_reserved(
             window, opencode_output_limit(window, max_tokens), compact_at
         )
+    preserve_recent_tokens = _get_compaction_keep(model, compact_keep)
+    # One global amount sized from the launch model, so no other model's window matters.
+    _warn_compact_keep_ignored([model], compact_keep)
     # Keep the provider definition in this private session file. The launch path adjusts effective provider filters in the higher-priority inline overlay.
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = _opencode_provider(
         base, key, model, max_tokens, request_body, headers, served_models, v2
@@ -601,7 +608,7 @@ def write_opencode_config(
         compaction = config.get("compaction")
         if (
             isinstance(compaction, dict)
-            and compaction.keys() == {"auto", "reserved"}
+            and compaction.keys() - {"preserve_recent_tokens"} == {"auto", "reserved"}
             and compaction["auto"] is True
             and compaction["reserved"] in managed
         ):
@@ -624,6 +631,11 @@ def write_opencode_config(
         compaction = _subdict(config, "compaction")
         compaction["auto"] = True
         compaction["reserved"] = reserved
+        # 1.x's key; 2.x normalizes it to keep.tokens, as it does reserved to buffer.
+        if preserve_recent_tokens is None:
+            compaction.pop("preserve_recent_tokens", None)
+        else:
+            compaction["preserve_recent_tokens"] = preserve_recent_tokens
     tools = ("edit", "bash", "webfetch", *(("task",) if as_subagent else ()))
     if yolo:
         # Fallback for commands without native --auto and for the append-safe bare --no-launch command, where the subcommand is not known yet. Rides inline (OPENCODE_CONFIG_CONTENT) so it wins over a project config. TUI and `run` launches use --auto and call here with yolo=False, letting OpenCode preserve explicit deny rules.
@@ -663,6 +675,7 @@ def opencode(
     presence_penalty: Optional[float] = _PRESENCE_PENALTY_OPTION,
     max_tokens: Optional[int] = _MAX_TOKENS_OPTION,
     compact_at: Optional[float] = _COMPACT_AT_OPTION,
+    compact_keep: Optional[float] = _COMPACT_KEEP_OPTION,
     model_load: bool = _MODEL_LOAD_OPTION,
     url: Optional[list[str]] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
@@ -707,6 +720,7 @@ def opencode(
             repetition_penalty = repetition_penalty,
             presence_penalty = presence_penalty,
             compact_at = compact_at,
+            compact_keep = compact_keep,
             api_key = api_key,
             header = header,
             model_load = model_load,
@@ -796,6 +810,11 @@ def opencode(
         if compact_at is not None:
             typer.echo(
                 "Warning: --compact-at does not apply with --as-subagent for OpenCode; ignoring it.",
+                err = True,
+            )
+        if compact_keep is not None:
+            typer.echo(
+                "Warning: --compact-keep does not apply with --as-subagent for OpenCode; ignoring it.",
                 err = True,
             )
         # Stay append-safe for a bare no-launch recipe: a later `run <prompt>` would make `opencode --auto run ...` parse as the TUI, so keep yolo in the inline fallback.
@@ -894,6 +913,7 @@ def opencode(
             request_body = server_options.request_body(),
             headers = headers,
             compact_at = compact_at,
+            compact_keep = compact_keep,
             mcp_servers = mcp_servers,
             served_models = served_models,
             v2 = opencode_v2,

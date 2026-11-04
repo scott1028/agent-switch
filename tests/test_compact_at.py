@@ -99,14 +99,22 @@ def test_opencode_compact_at_scales_reserved(fake_vllm, tmp_path):
     )
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
-    assert config["compaction"] == {"auto": True, "reserved": 19660}  # 131072 * 0.15
+    assert config["compaction"] == {
+        "auto": True,
+        "reserved": 19660,  # 131072 * 0.15
+        "preserve_recent_tokens": 26214,  # the --compact-keep default, 131072 * 0.2
+    }
 
 
 def test_opencode_compact_at_unset_keeps_default_reserved(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["opencode", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
     config = json.loads((tmp_path / "agents" / "opencode" / "opencode.json").read_text())
-    assert config["compaction"] == {"auto": True, "reserved": 131072 // 10}
+    assert config["compaction"] == {
+        "auto": True,
+        "reserved": 131072 // 10,
+        "preserve_recent_tokens": 26214,  # the --compact-keep default, 131072 * 0.2
+    }
 
 
 def _pi_settings(tmp_path) -> dict:
@@ -120,11 +128,16 @@ def test_pi_compact_at_sets_reserve(fake_vllm, tmp_path):
     )
     assert result.exit_code == 0, result.output
     # Pi compacts once the context exceeds contextWindow - reserveTokens.
-    assert _pi_settings(tmp_path)["compaction"] == {"enabled": True, "reserveTokens": 19660}  # 131072 * 0.15
+    assert _pi_settings(tmp_path)["compaction"] == {
+        "enabled": True,
+        "reserveTokens": 19660,  # 131072 * 0.15
+        # The --compact-keep default, 131072 * 0.2.
+        "modelOverrides": {f"agent-switch/{MODEL['id']}": {"keepRecentTokens": 26214}},
+    }
 
 
 def test_pi_compact_at_unset_omits_compaction(fake_vllm, tmp_path):
-    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", "--compact-keep", "0"])
     assert result.exit_code == 0, result.output
     assert "compaction" not in _pi_settings(tmp_path)
 
@@ -132,10 +145,13 @@ def test_pi_compact_at_unset_omits_compaction(fake_vllm, tmp_path):
 def test_pi_compact_at_cleared_on_rerun_without_flag(fake_vllm, tmp_path):
     result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", "--compact-at", "0.85"])
     assert result.exit_code == 0, result.output
-    assert "compaction" in _pi_settings(tmp_path)
+    assert "reserveTokens" in _pi_settings(tmp_path)["compaction"]
     result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch"])
     assert result.exit_code == 0, result.output
-    assert "compaction" not in _pi_settings(tmp_path)
+    assert _pi_settings(tmp_path)["compaction"] == {
+        "enabled": True,
+        "modelOverrides": {f"agent-switch/{MODEL['id']}": {"keepRecentTokens": 26214}},
+    }
 
 
 @pytest.mark.parametrize("value", ["0.3", "0.99", "1.5", "-0.1"])

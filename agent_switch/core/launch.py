@@ -362,6 +362,7 @@ def _fill_unreported_window(entry: dict) -> None:
     if entry["context_length"]:
         return
     entry["context_length"] = providers.DEFAULT_CONTEXT_LENGTH
+    entry["is_window_assumed"] = True
     typer.echo(
         f"Warning: the server did not report {entry['id']}'s context length; using "
         f"{providers.DEFAULT_CONTEXT_LENGTH:,} tokens. Pass --context-length <tokens> to set it.",
@@ -442,7 +443,9 @@ def _get_served_models(
         if not served["context_length"] and served["id"] != model_id
     ]
     for served in served_models:
-        served["context_length"] = served["context_length"] or providers.DEFAULT_CONTEXT_LENGTH
+        if not served["context_length"]:
+            served["context_length"] = providers.DEFAULT_CONTEXT_LENGTH
+            served["is_window_assumed"] = True
     if unreported and should_warn:
         typer.echo(
             f"Warning: the server did not report a context length for {', '.join(unreported)}; "

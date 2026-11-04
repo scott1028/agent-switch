@@ -243,7 +243,11 @@ def test_pi_compaction_overrides_every_served_model_window(tmp_path):
     # Pi's contextWindow - reserveTokens threshold negative and compacts from token one.
     assert compaction["enabled"] is True
     assert compaction["reserveTokens"] == 37500  # 250000 * (1 - 0.85)
-    assert compaction["modelOverrides"] == {"agent-switch/small": {"reserveTokens": 4915}}
+    assert "keepRecentTokens" not in compaction
+    assert compaction["modelOverrides"] == {
+        "agent-switch/launch": {"keepRecentTokens": 50000},  # 250000 * 0.2
+        "agent-switch/small": {"reserveTokens": 4915, "keepRecentTokens": 6553},
+    }
 
 
 def test_pi_compaction_undo_clears_per_model_overrides(tmp_path):
@@ -258,7 +262,9 @@ def test_pi_compaction_undo_clears_per_model_overrides(tmp_path):
         },
         "theme": "dark",
     }))
-    pi_agent.write_pi_compaction(agent_dir, {"id": "launch", "context_length": 250000}, None)
+    pi_agent.write_pi_compaction(
+        agent_dir, {"id": "launch", "context_length": 250000}, None, compact_keep = 0
+    )
     settings = json.loads(path.read_text())
     assert "compaction" not in settings
     assert settings["theme"] == "dark"  # unrelated settings stay
@@ -318,7 +324,14 @@ def test_connect_pi_no_launch(fake_vllm, tmp_path, monkeypatch):
     ]
     assert (home / ".pi" / "agent" / "extensions" / "mine.ts").is_file()
     settings = json.loads((home / ".pi" / "agent" / "settings.json").read_text())
-    assert settings == {"packages": ["npm:pi-mine"], "defaultThinkingLevel": "xhigh"}
+    assert settings == {
+        "packages": ["npm:pi-mine"],
+        "defaultThinkingLevel": "xhigh",
+        "compaction": {
+            "enabled": True,
+            "modelOverrides": {f"agent-switch/{MODEL['id']}": {"keepRecentTokens": 26214}},
+        },
+    }
     assert not (user_agent_dir / "models.json").exists()
 
 
