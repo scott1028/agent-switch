@@ -41,7 +41,8 @@ start_app = typer.Typer(
     "server (--provider lists the supported types) with a throwaway, session-only "
     "configuration; without them it runs natively, on its own model, login and config, and only "
     "the shared flags (MCP mounting, --yolo) are added. Either way your own agent config is not "
-    "modified. Repeat --url to put several model servers behind one session proxy; see "
+    "modified unless you ask for it with claude's --global-project-plans. Repeat --url to put "
+    "several model servers behind one session proxy; see "
     "<agent> --help. "
     "A name like claude-<x>, codex-<x>, opencode-<x>, pi-<x>, dsh-<x> or dsh-tui-<x> runs your "
     "own bash function, alias or script of that name as that agent, through `bash -ic`.",
@@ -101,9 +102,22 @@ _MCP_EPILOG = (
     "  --url b:https://gw.example/v1 --api-key b:KEY --model b:qwen3:8b"
 )
 
+# claude only: the one flag that edits the agent's own config instead of a session's.
+_CLAUDE_GLOBAL_PLANS_EPILOG = (
+    "Global plans\n"
+    "--global-project-plans edits claude's own settings.json and exits without\n"
+    'launching: it sets "plansDirectory": ".tmp", so claude saves plans in\n'
+    "<project>/.tmp on every run, also when started without agent-switch.\n"
+    "File: $CLAUDE_CONFIG_DIR or ~/.claude; claude-<x> uses ~/.claude-<x>.\n"
+    "Undo: --no-global-project-plans removes that key again."
+)
+
 # Registration order is the --help order; the old dsh decorators applied bottom-up (dsh, dsh-tui, dst).
 start_app.command(
-    "claude", cls = _PassthroughCommand, context_settings = _PASSTHROUGH, epilog = _MCP_EPILOG
+    "claude",
+    cls = _PassthroughCommand,
+    context_settings = _PASSTHROUGH,
+    epilog = f"{_MCP_EPILOG}\n\n{_CLAUDE_GLOBAL_PLANS_EPILOG}",
 )(claude.claude)
 start_app.command(
     "codex", cls = _PassthroughCommand, context_settings = _PASSTHROUGH, epilog = _MCP_EPILOG

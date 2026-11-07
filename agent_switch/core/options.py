@@ -319,6 +319,16 @@ _PROJECT_PLANS_OPTION = typer.Option(
 )
 
 
+# None leaves claude's global settings alone; True adds plansDirectory, False removes it.
+_GLOBAL_PROJECT_PLANS_OPTION = typer.Option(
+    None,
+    "--global-project-plans/--no-global-project-plans",
+    show_default = False,
+    rich_help_panel = _PANEL_SESSION,
+    help = "Edit claude's global settings.json; see Global plans.",
+)
+
+
 _AS_SUBAGENT_OPTION = typer.Option(
     False,
     "--as-subagent",

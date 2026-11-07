@@ -39,6 +39,7 @@ from agent_switch.core.options import (
     _AS_SUBAGENT_OPTION,
     _COMPACT_AT_OPTION,
     _CONTEXT_OPTION,
+    _GLOBAL_PROJECT_PLANS_OPTION,
     _HEADER_OPTION,
     _KEY_OPTION,
     _LAUNCH_OPTION,
@@ -75,7 +76,7 @@ from agent_switch.core.options import (
 from agent_switch.core.platform import _merge_wslenv, _wsl_bridge_names, _wsl_windows_executable
 from agent_switch.core.session import _agent_config_path, _session_config
 from agent_switch.core.skills import load_skills, write_skills
-from agent_switch.core.storage import _write_private_json, _write_private_text
+from agent_switch.core.storage import _read_json_object, _write_private_json, _write_private_text
 from agent_switch.providers.utils import get_has_custom_authorization
 
 
@@ -471,6 +472,42 @@ def _get_claude_plans_flags(config: Path, project_plans: bool) -> list:
     return [f"--settings={_agent_config_path(settings, ['claude'])}"]
 
 
+def _write_global_project_plans(alias: Optional[str], should_save_in_project: bool) -> None:
+    """Add or remove plansDirectory in claude's own settings.json, outside any session."""
+    name = alias or "claude"
+    # An alias sets its own CLAUDE_CONFIG_DIR, which agent-switch cannot read; use ~/.<alias>.
+    configured = None if alias else os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / f".{name}"
+    if not config_dir.is_dir():
+        _fail(f"{config_dir} does not exist; start {name} once to create it.")
+    path = config_dir / "settings.json"
+    settings = _read_json_object(path)
+    if settings is None:
+        _fail(f"{path} is not a JSON object; left it untouched.")
+    previous = settings.get("plansDirectory")
+    if should_save_in_project:
+        if previous == _CLAUDE_PLANS_DIRECTORY:
+            typer.echo(
+                f'{path} already sets "plansDirectory": "{_CLAUDE_PLANS_DIRECTORY}"; nothing changed.'
+            )
+            return
+        settings["plansDirectory"] = _CLAUDE_PLANS_DIRECTORY
+    elif "plansDirectory" in settings:
+        del settings["plansDirectory"]
+    else:
+        typer.echo(f'{path} has no "plansDirectory"; nothing changed.')
+        return
+    # In place, so a symlinked settings.json and its permissions survive; non-ASCII stays as is.
+    _write_private_text(path, json.dumps(settings, indent = 2, ensure_ascii = False) + "\n")
+    if not should_save_in_project:
+        typer.echo(f'Removed "plansDirectory" from {path}; {name} uses its default plans dir again.')
+        return
+    replaced = "" if previous is None else f" (was {json.dumps(previous, ensure_ascii = False)})"
+    typer.echo(f'Set "plansDirectory": "{_CLAUDE_PLANS_DIRECTORY}" in {path}{replaced}.')
+    typer.echo(f"{name} now saves plans in <project>/.tmp on every run, also outside agent-switch.")
+    typer.echo(f"Undo: agent-switch {name} --no-global-project-plans")
+
+
 def claude(
     ctx: typer.Context,
     model: Optional[str] = _MODEL_OPTION,
@@ -503,8 +540,13 @@ def claude(
     skill: Optional[list[str]] = _SKILL_OPTION,
     skill_set: Optional[list[str]] = _SKILL_SET_OPTION,
     project_plans: bool = _PROJECT_PLANS_OPTION,
+    global_project_plans: Optional[bool] = _GLOBAL_PROJECT_PLANS_OPTION,
 ):
     """Point Claude Code at a local model server and start it."""
+    # A one-off edit of claude's own settings: nothing is resolved or launched.
+    if global_project_plans is not None:
+        _write_global_project_plans(ctx.meta.get(_ALIAS_META), global_project_plans)
+        return
     # Validate the MCP selection before _connect, so a registry error fails fast.
     mcp_servers = load_mcp_servers(
         mcp,

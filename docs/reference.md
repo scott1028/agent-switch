@@ -241,6 +241,24 @@ project's `.gitignore` if git should not see the plans.
   stays last.
 - `--no-project-plans` keeps claude's default, `~/.claude/plans/`.
 
+To keep plans with the project when claude starts without agent-switch, write the setting into
+claude's own global settings:
+
+```sh
+agent-switch claude --global-project-plans            # $CLAUDE_CONFIG_DIR, else ~/.claude
+agent-switch claude-personal --global-project-plans   # ~/.claude-personal
+agent-switch claude-personal --no-global-project-plans
+```
+
+- It adds `"plansDirectory": ".tmp"` to `settings.json` in that directory and exits without
+  starting claude. Other keys and the file's layout stay as they were.
+- A `claude-<x>` alias sets its own `CLAUDE_CONFIG_DIR`, which agent-switch cannot read, so it edits
+  `~/.claude-<x>/settings.json`. The directory must already exist.
+- The setting is global: every claude run with that config uses it, also runs started without
+  agent-switch. While it is set, `--no-project-plans` no longer falls back to
+  `~/.claude/plans/`.
+- `--no-global-project-plans` removes the key again.
+
 ### Context and compaction
 
 - The context window comes from the server: Ollama `/api/ps`, LM Studio's loaded instance,
@@ -302,7 +320,9 @@ project's `.gitignore` if git should not see the plans.
 ## Native launch
 
 Without `--url` or `--provider`, the agent starts natively: it keeps its own model, login and
-config, and agent-switch writes nothing into the agent's own config.
+config, and agent-switch writes nothing into the agent's own config. The one exception is claude's
+`--global-project-plans`, which edits claude's `settings.json` on request (see
+[Plan files](#plan-files)).
 
 - Only the shared flags apply: the MCP flags, `--yolo` and claude's `--project-plans`.
 - Flags that only make sense with a local model server fail with "needs --url or --provider":

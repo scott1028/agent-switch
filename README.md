@@ -86,6 +86,7 @@ Use these with `--url` or `--provider`:
 | `--persist` | Keep the session files so the agent can resume later. |
 | `--as-subagent` | Keep the agent's own model and add a local model as a helper. |
 | `--no-project-plans` | Keep Claude Code plans in `~/.claude/plans` instead of `<project>/.tmp`. |
+| `--global-project-plans` | Write the `<project>/.tmp` plan setting into Claude Code's global `settings.json`, so it also applies without agent-switch. `--no-global-project-plans` removes it. |
 
 `--as-subagent` supports Claude Code, Codex, OpenCode, and Pi. It cannot be combined with MCP flags.
 `--yolo` lets the agent approve actions automatically. It also works without a local server.
