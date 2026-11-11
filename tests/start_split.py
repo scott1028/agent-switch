@@ -7,6 +7,7 @@ from agent_switch import start
 from agent_switch.agents import claude as _claude
 from agent_switch.agents import codex as _codex
 from agent_switch.agents import dsh as _dsh
+from agent_switch.agents import omp as _omp
 from agent_switch.agents import opencode as _opencode
 from agent_switch.agents import pi as _pi
 from agent_switch.core import install as _install
@@ -29,6 +30,7 @@ _SPLIT_MODULES = (
     _codex,
     _opencode,
     _pi,
+    _omp,
     _dsh,
 )
 

@@ -1,7 +1,7 @@
 [project]
 name = "agent-switch"
-version = "0.1.8"
-description = "Launch Claude Code, Codex, OpenCode, Pi or DeepSeek Harness (dsh or its TUI) against a local OpenAI-compatible model server."
+version = "0.1.9"
+description = "Launch Claude Code, Codex, OpenCode, Pi, OMP (oh-my-pi) or DeepSeek Harness (dsh or its TUI) against a local OpenAI-compatible model server."
 readme = "README.md"
 license = "AGPL-3.0-only AND Apache-2.0"
 license-files = ["LICENSE", "NOTICE.md", "LICENSES/Apache-2.0.txt"]

@@ -319,6 +319,20 @@ def test_augment_path_skips_missing_and_duplicate_dirs(monkeypatch, tmp_path):
     assert os.environ["PATH"].split(os.pathsep).count(str(local_bin)) == 1
 
 
+@pytest.mark.parametrize(("bun_install", "bun_root"), [(None, ".bun"), ("", ".bun"), ("custom", "custom")])
+def test_augment_path_adds_bun_global_bin(monkeypatch, tmp_path, bun_install, bun_root):
+    # omp's install hint is `bun install -g`, whose shims land in ${BUN_INSTALL:-~/.bun}/bin.
+    bun_bin = tmp_path / bun_root / "bin"
+    bun_bin.mkdir(parents = True)
+    if bun_install is not None:
+        monkeypatch.setenv("BUN_INSTALL", str(tmp_path / bun_install) if bun_install else "")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "no-appdata"))  # skip the npm candidate
+    monkeypatch.setenv("PATH", str(tmp_path / "existing"))
+    core_install._augment_path_with_install_dirs()
+    assert os.environ["PATH"].split(os.pathsep)[-1] == str(bun_bin)
+
+
 def test_augment_path_adds_npm_global_bin_on_windows(monkeypatch, tmp_path):
     # npm -g shims (codex/opencode/pi) land in %APPDATA%\npm on Windows; add it so a freshly
     # installed npm agent resolves even when that dir isn't on PATH yet.

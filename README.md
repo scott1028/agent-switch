@@ -2,8 +2,8 @@
 
 ![agent-switch mascot](docs/mascot.png)
 
-**Run Claude Code, Codex, OpenCode, Pi, or DeepSeek Harness on your own model server
-with one command. Your usual agent settings stay unchanged.**
+**Run Claude Code, Codex, OpenCode, Pi, OMP (oh-my-pi), or DeepSeek Harness on your own model
+server with one command. Your usual agent settings stay unchanged.**
 
 ![agent-switch starts OpenCode and lists the models from the connected servers](docs/agent-switch-opencode.gif)
 
@@ -17,7 +17,7 @@ with one command. Your usual agent settings stay unchanged.**
 | **Your own servers** | Works with the model servers people usually run: Ollama, LM Studio, llama-server, vLLM, and other OpenAI-compatible servers. | `agent-switch codex --provider ollama` |
 | **Your setup stays as it is** | Leave out `--url` and `--provider`, and the agent runs as usual, with its own model, account, and settings. | `agent-switch claude` |
 | **Keep your main model** | The agent keeps its usual model and gets a local model as a helper it can hand work to. | `agent-switch claude --url http://127.0.0.1:8080 --as-subagent` |
-| **Agents** | Claude Code, Codex, OpenCode, Pi, and DeepSeek Harness (`dsh`, `dsh-tui`, or `dst`). | `agent-switch pi --provider lmstudio` |
+| **Agents** | Claude Code, Codex, OpenCode, Pi, OMP (oh-my-pi, `omp`), and DeepSeek Harness (`dsh`, `dsh-tui`, or `dst`). | `agent-switch pi --provider lmstudio` |
 
 ## Install
 
@@ -52,6 +52,7 @@ Start your model server first. agent-switch connects to it; it does not start th
 ```sh
 # Give the server's address
 agent-switch claude --url http://127.0.0.1:8080
+agent-switch omp --url http://127.0.0.1:8080
 
 # Or use a provider's default address
 agent-switch codex --provider ollama
@@ -132,7 +133,8 @@ agent-switch codex --mcp-all
 
 Without a local model server, these tools are added to the agent's existing tools.
 With `--url` or `--provider`, the selected MCP servers replace the agent's own MCP servers
-for that session. [Registry format, authentication, and examples](docs/reference.md#mcp-servers).
+for that session (for OMP, only its user-level `mcp.json`).
+[Registry format, authentication, and examples](docs/reference.md#mcp-servers).
 
 ## Add a skill for one session
 

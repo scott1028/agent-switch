@@ -72,6 +72,7 @@ agent-switch claude                                  # native: Claude's own mode
 agent-switch codex --url http://127.0.0.1:11434      # Ollama; provider detected from the URL
 agent-switch opencode --provider lmstudio -m qwen/qwen3-8b --context-length 32768
 agent-switch pi --url http://127.0.0.1:8000/v1 --no-launch   # print the env and command instead
+agent-switch omp --url http://127.0.0.1:8080         # OMP (oh-my-pi) on a session agent dir
 agent-switch claude --url http://127.0.0.1:8080 --as-subagent  # Claude's model with a local subagent
 agent-switch dsh --url http://127.0.0.1:8080         # DeepSeek Harness, web UI
 agent-switch dsh -- --profile headless "fix the failing test"   # one task, print the result, exit
@@ -155,6 +156,103 @@ Limits:
 If dsh or dsh-tui stops at start with "No usable native binding found", see
 [Troubleshooting](troubleshooting.md#dsh-and-dst-crash-with-no-usable-native-binding-found).
 
+### OMP (oh-my-pi)
+
+`agent-switch omp` starts OMP, the `omp` command of `@oh-my-pi/pi-coding-agent`. When `omp` is
+missing, agent-switch offers to run `bun install -g @oh-my-pi/pi-coding-agent`. It also finds `omp`
+in `$BUN_INSTALL/bin` (`~/.bun/bin` when `BUN_INSTALL` is unset or empty) when that folder is not on
+your PATH.
+
+With `--url` or `--provider`, omp runs on a session agent dir:
+
+- `PI_CODING_AGENT_DIR` points at `<session>/agent`. `PI_PROFILE` and
+  `PI_CODING_AGENT_SESSION_DIR` are cleared, so omp keeps its sessions in the session agent dir,
+  one folder per project. `HOME` stays yours.
+- omp and Bun fill only unset or empty variables from `.env` files: `.env` in the project, the
+  session agent dir, `~/.omp` and `~`, plus the project's `.env.local`, `.env.<NODE_ENV>` and
+  `.env.<NODE_ENV>.local` that Bun loads before omp starts (`development` when `NODE_ENV` is
+  unset). So agent-switch sets what such a line must not change:
+  - `PI_CONFIG_DIR` to the root agent-switch reads (yours, else `.omp`) and `OMP_PROFILE` to
+    `default`.
+  - When one of these files sets `PI_CODING_AGENT_SESSION_DIR` (or, in omp's own files,
+    `OMP_CODING_AGENT_SESSION_DIR`), `PI_CODING_AGENT_SESSION_DIR` to a folder of the project's
+    own, `<session>/agent/sessions-pinned/<hash of the project dir>`, so the sessions stay in the
+    session and projects stay apart. The project dir is the one omp runs in, so a `--cwd` after
+    `--` counts.
+  - When one of them sets `OMP_PROFILE` or `PI_PROFILE` to a named profile, the launch stops
+    with the file's name: a profile ignores `PI_CODING_AGENT_DIR`.
+  - When one of them, other than the session agent dir's own, sets `PI_CODING_AGENT_DIR` or
+    `PI_CONFIG_DIR` (or, in omp's own files, `OMP_CODING_AGENT_DIR` or `OMP_CONFIG_DIR`) and your
+    shell does not, the launch stops too: your own omp follows it, but agent-switch reads your
+    settings and resources only from the shell's value. A non-empty shell value wins over the
+    file, for omp too, so then the line is ignored.
+  In both cases, export the variable in your shell instead of the `.env` file: agent-switch
+  follows a shell value (a profile with `--url`/`--provider`). These checks read one
+  `KEY=VALUE` per line, so a value continued on the next line, which Bun's parser accepts, is not
+  seen. All of them run before agent-switch connects to the model server.
+- omp starts with `--model agent-switch/<id>`. The session `models.yml` holds the `agent-switch`
+  provider with one row per served model; the session `config.yml` turns off omp's onboarding
+  (`startup.setupWizard: false`) and starts at `defaultThinkingLevel: xhigh` where agent-switch
+  sets the thinking format. Either key already set in a `--persist` session keeps its value.
+- From your omp agent dir (`~/.omp/agent`, `~/.omp/profiles/<name>/agent` for an active profile,
+  or your `PI_CODING_AGENT_DIR`) only these are linked: `skills`, `commands`, `rules`, `RULES.md`,
+  `prompts`, `extensions`, `instructions`, `hooks`, `tools`, `agents`, `SYSTEM.md`,
+  `SYSTEM_TEMPLATE.md`, `AGENTS.md`, `PERSONALITY.md`, `secrets.yml` and `ssh.json`. A real file
+  or folder of the same name in a `--persist` session stays the session's own. A file that cannot
+  be linked, for example on Windows without the right to make symlinks, is copied, and the next
+  run refreshes the copy or removes it with your file. A copy goes to a temporary name first, so
+  one that fails part way leaves nothing. When you have a `secrets.yml` of your own and
+  `secrets.enabled` is on (in your settings or the session's), agent-switch stops before
+  connecting unless the session's `secrets.yml` is a link to yours or a whole copy it made this
+  run: omp reads the secret rules only from its agent dir.
+- Not inherited from your omp agent dir: `config.yml`, `models.yml`, `mcp.json`, the legacy
+  `settings.json`, `.env`, your login (`agent.db`) and your sessions.
+- Your safety settings do come along, because without them omp approves every tool call:
+  `tools.approvalMode`, `tools.approval`, `tools.restrictedFolders`, `mcp.enableProjectConfig`,
+  `disabledProviders`, `bash.patterns`, `bash.gitGuard` and `secrets.enabled` are copied from
+  your omp settings file (`config.yml`, else `config.yaml`, else the legacy `settings.json`) into
+  the session `config.yml` on every launch, and your `mcp.json` `disabledServers` list, minus the
+  servers mounted now, into the session `mcp.json`. A value you change inside a `--persist`
+  session stays; one you remove from your own file goes from the session too. If that settings
+  file exists but cannot be read, agent-switch stops, as omp itself does. `--yolo` still switches
+  omp to its yolo approval mode, though restricted folders ask even then.
+- omp still reads what lives outside its agent dir: plugins in `~/.omp/plugins` (only there, not
+  in an XDG or profile plugins folder), project config such as `.omp/mcp.json` or a project
+  `.claude/.mcp.json` (unless your `mcp.enableProjectConfig: false` came along), and `~/.agents`
+  skills through `HOME`. Claude Code and Codex user config load only when a project-level
+  `enabledProviders` enables them, or for Claude Code when `CLAUDE_CONFIG_DIR` is set: your own
+  `enabledProviders` is not copied.
+
+omp reads a config value that starts with `!` as a shell command, and one that is the name of a
+set environment variable as that variable's value. So the session files never hold such values:
+
+- The API key (the session proxy's token with several `--url`), `--header` values and mounted
+  MCP http header values are written as the names `AGENT_SWITCH_OMP_API_KEY`,
+  `AGENT_SWITCH_OMP_HEADER_<n>` and `AGENT_SWITCH_OMP_MCP_<n>`, and the values ride in omp's
+  environment, where its `.env` files cannot replace them. omp then sends each one exactly as
+  given. An empty value stays empty in the file, and omp leaves that header out. `--no-launch`
+  prints these values in its recipe, like any other session env.
+- On Linux and macOS each mounted stdio server runs through a private (0700) `sh` wrapper in the
+  session folder, which sets the server's `env` and then starts it. Those values never enter
+  omp's environment, so its bash commands and other MCP servers do not see them, and `${` in the
+  server's command or arguments is fine. omp sees only the wrapper, so its check for the same
+  server under another name and its filter for browser MCP packages miss the real command.
+- On Windows, stdio `env` values ride in omp's environment as `AGENT_SWITCH_OMP_MCP_<n>` like the
+  header values, and omp would expand `${VAR}` in a stdio command or argument.
+- omp expands `${VAR}` in a mounted server's `url` (and, on Windows, its stdio command and
+  arguments) with no escape, so agent-switch stops when one of them contains `${`. Your own
+  servers in a merged `mcp.json` are left as they are.
+
+Limits:
+
+- `--as-subagent` is not supported for omp.
+- A `--profile` after `--` is refused whenever agent-switch sets `PI_CODING_AGENT_DIR` (`--url`
+  mode, and native launch with skills or MCP flags), because an omp profile ignores that variable.
+- With the `openai` thinking format, omp's `--thinking off` sends the lowest effort instead of
+  turning thinking off (see [Reasoning and sampling](#reasoning-and-sampling)).
+- Native launch and aliases have their own rules: see [Native launch](#native-launch) and
+  [Agent aliases](#agent-aliases).
+
 ### Headers
 
 `--header [SERVER:]NAME=VALUE` (repeat it) adds an HTTP header to every request sent to the model
@@ -224,7 +322,8 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 - `--persist` keeps the agent's agent-switch session folder, so the agent's own resume can reopen
   the session, for example `agent-switch codex --persist -- resume`.
 - Without it, codex, pi and dsh run with their whole home moved into a session folder that is
-  deleted on exit.
+  deleted on exit. omp keeps `HOME`, but its agent dir, and with it its sessions, lives in that
+  folder too.
 - claude and opencode keep sessions in your own stores (`~/.claude`, `~/.local/share/opencode`), so
   they can always resume.
 
@@ -270,22 +369,25 @@ agent-switch claude-personal --no-global-project-plans
   server that is already running. `--no-model-load` makes it a pure client that never loads,
   reloads or unloads anything; the model must already be loaded.
 - `--compact-at 0.85` starts the agent's auto-compaction when 85% of the window is used, scaled per
-  agent (Claude Code, Codex, OpenCode, Pi and DeepSeek Harness). The range is 0.5–0.95; unset keeps
-  each agent's own behavior.
+  agent (Claude Code, Codex, OpenCode, Pi, OMP and DeepSeek Harness). The range is 0.5–0.95; unset
+  keeps each agent's own behavior.
   - Claude Code applies the fraction to its own effective window (the window minus its output
     reserve), so it can only start compaction earlier than its built-in trigger, never later.
     agent-switch warns about this whenever you pass `--compact-at` to Claude Code.
   - Codex caps it at 0.9 of the window, so a value above 0.9 acts as 0.9, and agent-switch warns.
   - DeepSeek Harness applies it only to its headless profile (`--profile headless`). Its web profile
     ignores it, and agent-switch warns before starting it.
-- `--compact-keep 0.3` keeps the most recent 30% of the window beside the summary when OpenCode or
-  Pi compacts. Unset keeps 20%, so a 250,000-token window keeps 50,000 tokens and a 1,000,000-token
-  window keeps 200,000. The range is 0–0.4. `0` leaves the agent's own default (OpenCode 2.x 15,000
-  tokens, Pi 20,000). With `--as-subagent` the flag is ignored with a warning.
+  - OMP gets it as `compaction.thresholdPercent` (85 for 0.85), which omp applies to each model's
+    own window.
+- `--compact-keep 0.3` keeps the most recent 30% of the window beside the summary when OpenCode,
+  Pi or OMP compacts. Unset keeps 20%, so a 250,000-token window keeps 50,000 tokens and a
+  1,000,000-token window keeps 200,000. The range is 0–0.4. `0` leaves the agent's own default
+  (OpenCode 2.x 15,000 tokens, Pi and OMP 20,000). With `--as-subagent` the flag is ignored with a
+  warning.
   - A model whose window the server does not report gets no amount and uses the agent's own
     default. A `--compact-keep` you passed is ignored for those models only, with a warning that
-    names them. OpenCode's amount is global, so only its launch model counts. `--context-length`
-    counts as a reported window.
+    names them. OpenCode's and OMP's amount is global, so only the launch model counts.
+    `--context-length` counts as a reported window.
   - Pi keeps the original messages. OpenCode turns the kept part into text: tool output is cut to
     1,250 characters, reasoning is dropped, and attachments keep only their names.
   - Pi gets a separate amount for each served model with a reported window. The other models use
@@ -296,6 +398,8 @@ agent-switch claude-personal --no-global-project-plans
     mid-session does not recalculate it. Compaction can then run often, so use a smaller
     `--compact-keep` for such models.
   - OpenCode 1.x is also limited by `tail_turns` if you set it.
+  - OMP's amount (`compaction.keepRecentTokens`) comes from the launch model's window, and every
+    served model shares it. On a small window omp keeps less by itself.
 
 ### Reasoning and sampling
 
@@ -311,6 +415,14 @@ agent-switch claude-personal --no-global-project-plans
   `chat_template_kwargs`; other servers get `reasoning_effort`. `--reasoning off` and
   `--reasoning-effort` only set the starting level, and `--reasoning auto` leaves thinking to the
   server. LM Studio and Ollama keep the pinned behaviour above.
+- OMP on llama.cpp, vLLM or another OpenAI-compatible server also picks the thinking level itself:
+  every model offers `minimal` to `max`, and a session starts at `xhigh` (a level saved in a
+  `--persist` session stays). llama.cpp and vLLM get it as `chat_template_kwargs`
+  (`enable_thinking`, plus `reasoning_effort` when thinking is on); other servers get
+  `reasoning_effort`, and there omp's `off` sends the lowest effort instead of turning thinking
+  off. `--reasoning off` and `--reasoning-effort` set the starting level (omp's `--thinking`), and
+  `--reasoning auto` leaves thinking to the server. LM Studio and Ollama keep the pinned behaviour
+  above.
 - `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--repetition-penalty` and `--presence-penalty`
   are set in the agent's own requests, not on the server. Unset keeps the model's recommended
   sampling; a value the agent cannot send is ignored with a warning.
@@ -347,10 +459,28 @@ receives them its own way, and agent-switch writes only into its own session fol
 | OpenCode | `OPENCODE_CONFIG=<session>/opencode.json` holding only `$schema` and `mcp` |
 | Pi | `--mcp-config <session>/mcp.json`; pi itself has no such flag and rejects it, so this needs an extension that registers it, such as `pi-mcp-adapter` |
 | dsh, dsh-tui, dst | `--patch <session>/agent-switch.patch.yml` with only the MCP `insert` row; without MCP flags, no patch at all |
+| OMP | an overlay agent dir, `PI_CODING_AGENT_DIR=<session>/agent`, that links every entry of your omp agent dir, except that `mcp.json` is a merged copy: your servers plus the mounted ones, which reach omp as in `--url` mode: stdio servers through wrappers, header values in env vars (see [OMP](#omp-oh-my-pi)). A mounted server wins a shared name over your user-level servers and is taken out of your `disabledServers`; a same-name server in project `.omp/mcp.json` still wins. `/mcp add`, `remove` or `disable` inside that session changes only the session copy. |
 
 Native launch always uses a temporary session folder. `--no-launch` uses a fixed
 `~/.agent-switch/agents/<agent>-native` folder and prints the env and command instead of starting
 the agent.
+
+OMP uses its overlay only with `--skill`, `--skill-set` or MCP flags. Without them, omp starts with
+your environment unchanged, plus `--yolo` if you pass it. The overlay moves omp's agent dir, so a
+few setups cannot use it:
+
+- An active omp profile (`OMP_PROFILE`, or `PI_PROFILE` when `OMP_PROFILE` is unset): the overlay
+  would switch the profile off. An empty or `default` value is fine and is cleared.
+- On Linux and macOS, an existing `$XDG_DATA_HOME/omp`, `$XDG_STATE_HOME/omp` or
+  `$XDG_CACHE_HOME/omp` while you use the default agent dir: omp keeps your login and sessions
+  there, and the overlay would hide them. An `XDG_*_HOME` set only in a `.env` file is not seen by
+  this check.
+- A `--profile` after `--`.
+
+For those, use `--url`/`--provider`, or add the skill or MCP server to your own omp config. As in
+`--url` mode, the overlay sets `PI_CONFIG_DIR` and `OMP_PROFILE=default`, and stops when a `.env`
+file selects a named profile, an agent dir or a config root (see [OMP](#omp-oh-my-pi)). Your
+`PI_CODING_AGENT_SESSION_DIR` stays as it is.
 
 ## Agent aliases
 
@@ -362,20 +492,23 @@ agent-switch claude-personal
 agent-switch codex-personal --mcp-stdio 'blender:"uv run --directory ~/blender-mcp blender-mcp"'
 ```
 
-- Name lookup: the exact subcommands (`claude`, `codex`, `opencode`, `pi`, `dsh`, `dsh-tui`, `dst`)
-  always win. Otherwise `dsh-tui-<x>` is dsh-tui, `dsh-<x>` is dsh, and `claude-<x>`, `codex-<x>`,
-  `opencode-<x>` and `pi-<x>` are that agent. Anything else is "No such command".
+- Name lookup: the exact subcommands (`claude`, `codex`, `opencode`, `pi`, `omp`, `dsh`, `dsh-tui`,
+  `dst`) always win. Otherwise `dsh-tui-<x>` is dsh-tui, `dsh-<x>` is dsh, and `claude-<x>`,
+  `codex-<x>`, `opencode-<x>`, `pi-<x>` and `omp-<x>` are that agent. Anything else is "No such
+  command".
 - The alias replaces only the program name. agent-switch runs
   `bash -ic '<name> "$@"' agent-switch <agent args>`, so the function must pass `"$@"` on to the
   agent; the environment agent-switch builds still reaches it.
 - The name must match `[A-Za-z0-9._-]+`, `bash` must be on PATH (aliases are not supported on
   Windows), and the name must exist in `bash -ic` as a function, alias or file.
 - An alias whose definition mentions `agent-switch` is refused, because it would call itself.
-- Native mode (no `--url`/`--provider`) works for every kind of alias.
+- Native mode (no `--url`/`--provider`) works for every kind of alias. `omp-*` runs natively only
+  without `--skill`, `--skill-set` and MCP flags.
 - Local model mode works only for `claude-*` and `opencode-*`, whose session settings travel as env
   vars and flags that a forwarding function keeps. With `--url`/`--provider`, these are refused:
-  `codex-*` (the function sets its own CODEX_HOME), `pi-*` (PI_CODING_AGENT_DIR) and
-  `dsh-*`/`dsh-tui-*` (DSH_HOME/HOME).
+  `codex-*` (the function sets its own CODEX_HOME), `pi-*` (PI_CODING_AGENT_DIR),
+  `dsh-*`/`dsh-tui-*` (DSH_HOME/HOME) and `omp-*` (an `omp --profile <name> --alias` alias selects
+  a profile, and a profile ignores PI_CODING_AGENT_DIR).
 - `--as-subagent` is refused for aliases.
 
 ## MCP servers
@@ -423,9 +556,11 @@ agent-switch codex --mcp-all                      # every server in the registry
   `--mcp-stdio 'blender:"uv run --directory ~/blender-mcp blender-mcp"'` runs it as
   `bash -lc 'exec uv run ...'`, so bash expands `~` and `${VAR}` itself. This needs `bash` on PATH
   and allows one command only: `;`, `&&`, `||`, `|` and `&` outside quotes are rejected, so put
-  several steps in a script.
+  several steps in a script. On Windows, OMP refuses `${` in a mounted command or argument,
+  because omp would expand it first; there, write `~` in this form, or use the plain form, where
+  agent-switch expands `${VAR}` itself.
 - Pi and the dsh-tui/dst TUI move `HOME` to the session folder, so there `~` points at that folder.
-  Use an absolute path with them.
+  Use an absolute path with them. OMP keeps `HOME`.
 - `--mcp-env [NAME:]KEY=VALUE` sets the server's environment; for the same KEY, the later VALUE
   wins. Put secrets in `--mcp-env`, not in args: args are always visible in the server's process
   arguments.
@@ -450,10 +585,15 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
 
 - With `--url`/`--provider`, the mounted servers replace the agent's own MCP servers for the
   session. (Native launch adds them instead; see [Native launch](#native-launch).)
-- Claude Code gets `--strict-mcp-config --mcp-config=<session file>`. Codex, OpenCode, Pi and dsh get
-  them through their isolated session config; OpenCode also copies the servers from your global
-  config that are not mounted, with `enabled: false` (OpenCode 2's `mcp.servers` with
+- Claude Code gets `--strict-mcp-config --mcp-config=<session file>`. Codex, OpenCode, Pi, OMP and
+  dsh get them through their isolated session config; OpenCode also copies the servers from your
+  global config that are not mounted, with `enabled: false` (OpenCode 2's `mcp.servers` with
   `disabled: true`; OpenCode 2 reads its global config from `OPENCODE_CONFIG_DIR` when set).
+- For OMP the session config is `<session>/agent/mcp.json`, which takes the place of your
+  user-level omp `mcp.json` only and keeps its `disabledServers`. omp still loads servers from
+  `~/.omp/plugins`, from project config such as `.omp/mcp.json` or a project `.claude/.mcp.json`
+  unless your `mcp.enableProjectConfig: false` came along, and from Claude Code or Codex user
+  config only as [OMP](#omp-oh-my-pi) describes.
 - MCP config inside the project you start from may still load: OpenCode's project `opencode.json`
   outranks the session overlay, for example.
 - An `oauth: true` http server is mounted through the pinned `mcp-remote` (needs `npx`). It signs in
@@ -472,7 +612,7 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
 `--provider`.
 
 - `PATH` is a folder containing `SKILL.md`. `SKILL.md` should start with YAML frontmatter that has
-  a `description`; Codex, Pi, and dsh skip a skill without one. Relative paths use the current
+  a `description`; Codex, Pi, OMP, and dsh skip a skill without one. Relative paths use the current
   directory; `~` expands to your home directory. The skill name comes from `NAME:`, then the file's
   frontmatter `name`, then the folder name. Names must use lowercase letters, digits, and single
   hyphens, up to 64 characters. When injected skills share a name, the later one wins and replaces
@@ -518,7 +658,7 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   before an absolute path, like `g:/x`, reads as a Windows drive, so use a longer
   namespace. Shared names follow the last-wins order above.
 - Skills cannot be combined with `--as-subagent`. `--skill` and `--skill-set` are not
-  supported for Codex, Pi, dsh-tui, or dst aliases.
+  supported for Codex, Pi, OMP, dsh-tui, or dst aliases.
 - agent-switch puts injected files in its session folder. A skill whose frontmatter `name` already
   matches links to its source, so edits are visible as the agent reads them. If the frontmatter
   `name` differs or is missing, agent-switch copies `SKILL.md` with `name: <name>` written in, then
@@ -528,8 +668,8 @@ agent-switch codex  --mcp-stdio 'ctx7:npx -y @upstash/context7-mcp' --mcp-env 'c
   cannot use the WSL links. `--persist` and `--no-launch` reuse their session folder; a later run
   removes the earlier injected files when you omit `--skill` and `--skill-set`.
 - agent-switch does not install skills into your persistent agent skill list or edit the source
-  folder. Codex and Pi native overlays link some of your real config files, so changes those agents
-  save through those links can still reach your normal config.
+  folder. Codex, Pi and OMP native overlays link some of your real config files, so changes those
+  agents save through those links can still reach your normal config.
 
 ```sh
 agent-switch claude --skill /tmp/skills/my-test-skill
@@ -544,6 +684,7 @@ agent-switch claude --skill https://github.com/user/repo/tree/main/skills/my-ski
 | Codex | Native mode sets an overlay `CODEX_HOME` linked to your Codex home. Routed mode uses the session `CODEX_HOME`; `-c skills.config` enables the injected path and disables the same-name entry. | The injected skill wins over same-name skills. |
 | OpenCode | `skills.paths` in the session `OPENCODE_CONFIG`. | The injected skill wins over global skills, `~/.claude/skills`, `~/.agents/skills`, and project `.opencode/skills` on OpenCode 2.0.3. OpenCode 1.x was not verified. |
 | Pi | `<agent dir>/skills`. Native mode sets an overlay `PI_CODING_AGENT_DIR` linked to your Pi home. | The injected skill wins over `~/.pi/agent/skills` and `~/.agents/skills`; project `.pi/skills` and `.agents/skills` win, as do a same-name skill from a `skills` entry in user or project `settings.json` and pi's own `--skill`. A `!name` pattern in `settings.json` or `--no-skills` hides the injected skill. From `~/.pi/agent/skills`, only top-level skill folders of the same name are hidden; same-name `*.md` files at its root and nested `SKILL.md` folders still load. With native `--skill`, user `settings.json` paths that start with `../` do not resolve. If a persisted session already has its own unowned `skills` folder, injection stops with an error instead of replacing it. |
+| OMP | `<agent dir>/skills`. Native mode sets an overlay `PI_CODING_AGENT_DIR` linked to your omp agent dir; `--url` mode uses the session agent dir. | The injected skill wins over the other skills in your agent dir's `skills` and over `~/.agents/skills`, Claude Code, Codex and omp plugin skills. Project `.omp/skills` and `skills.customDirectories` win. `--no-skills` hides it, and omp's `--skills` patterns filter it like any skill. |
 | dsh | A `--patch` row sets `skill-filesystem` `customSkillDirs`. | In the `headless` profile, the injected skill wins over `$DSH_HOME/skills` and `~/.agents/skills`; project `.dsh/skills` and `.agents/skills` win. In the `web` profile, a same-name skill the agent preset finds (project, `$DSH_HOME/skills`, `~/.agents/skills`) wins. The session row replaces an explicit `skill-filesystem` config in your profile. |
 | dsh-tui / dst | `preset-patch` rows add the session folder to the `standard`, `ptc`, and `liangshen` presets. The profile must export `./preset-patch`; the gate checks its runtime target, while its error asks for dsh-tui 0.17 or newer. The presets also need dsh 0.1.7 or newer. | Same order as dsh. `cordis`, `minimal`, and other unsupported profile presets do not receive injected skills; agent-switch warns when it knows the selected preset. |
 

@@ -77,6 +77,11 @@ def _get_augmented_path() -> Optional[str]:
     except (RuntimeError, OSError):
         home = None
     candidates = [home / ".local" / "bin", home / ".opencode" / "bin"] if home is not None else []
+    # `bun install -g` (omp) puts shims in ${BUN_INSTALL:-$HOME/.bun}/bin
+    # (oh-my-pi scripts/link-omp.sh:26).
+    bun_install = os.environ.get("BUN_INSTALL") or (home / ".bun" if home is not None else None)
+    if bun_install:
+        candidates.append(Path(bun_install) / "bin")
     if os.name == "nt":
         appdata = os.environ.get("APPDATA")
         if appdata:

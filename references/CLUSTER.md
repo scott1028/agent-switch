@@ -28,6 +28,7 @@ is wrong, missing, or outdated, and cite the upstream file and line for every it
 | codex | `references/codex` | `agent_switch/agents/codex.py`, `agent_switch/codex_subagent_mcp.py` |
 | opencode | `references/opencode` | `agent_switch/agents/opencode.py` |
 | pi | `references/pi` | `agent_switch/agents/pi.py`, `agent_switch/agents/pi_subagent.ts` |
+| omp | `references/oh-my-pi` | `agent_switch/agents/omp.py` |
 | dsh | `references/deepseek-harness` | `agent_switch/agents/dsh.py` |
 | dsh-tui | `references/dsh-tui` | `agent_switch/agents/dsh.py` |
 

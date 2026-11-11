@@ -10,6 +10,7 @@ import urllib.request
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 import agent_switch.start as start
@@ -319,6 +320,34 @@ def test_two_urls_pi_lists_every_servers_model(cli, fake_server_pair, monkeypatc
     models = json.loads(config_path.read_text())["providers"]["agent-switch"]["models"]
     # Both servers' models are listed under their NAME: prefixes, so /model can cross servers.
     assert [model["id"] for model in models] == ["a:qwen3", "b:qwen3"]
+
+
+def test_two_urls_omp_gets_the_proxy_token_through_the_env(cli, fake_server_pair, monkeypatch, tmp_path):
+    a, b = fake_server_pair
+    _openai_pair(a, b)
+    monkeypatch.setenv("HOME", str(tmp_path / "omp-home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "omp-home"))
+    for name in ("OMP_PROFILE", "PI_PROFILE", "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising = False)
+    set_start_attr(monkeypatch, "_resolve_or_install_agent", lambda name, hint, resolver: name)
+    seen = {}
+
+    def fake_run(command, env):
+        seen["env"] = env
+        return SimpleNamespace(returncode = 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = cli(
+        "omp", "--url", f"a:{a.base}", "--url", f"b:{b.base}", "--api-key", "a:server-key", "--persist",
+    )
+    assert result.exit_code == 0, result.output
+    models_path = tmp_path / "agents" / "omp" / "agent" / "models.yml"
+    provider = yaml.safe_load(models_path.read_text())["providers"]["agent-switch"]
+    assert [model["id"] for model in provider["models"]] == ["a:qwen3", "b:qwen3"]
+    # omp gets the session proxy's token, through the env like a single server's key.
+    assert provider["apiKey"] == "AGENT_SWITCH_OMP_API_KEY"
+    token = seen["env"]["AGENT_SWITCH_OMP_API_KEY"]
+    assert token and token != "server-key"
 
 
 def test_two_urls_named_alike_fail(cli, fake_server_pair):

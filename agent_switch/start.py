@@ -10,14 +10,14 @@ import click
 import typer
 from typer.core import TyperGroup
 
-from agent_switch.agents import claude, codex, dsh, opencode, pi
+from agent_switch.agents import claude, codex, dsh, omp, opencode, pi
 from agent_switch.core.launch import _ALIAS_KIND_META, _ALIAS_META
 from agent_switch.core.options import _PASSTHROUGH, _PassthroughCommand
 from agent_switch.core.storage import _agent_switch_home
 
 # `dsh-tui-<x>` must win over `dsh-<x>`, so the longer kinds come first; the suffix keeps the
 # whole name inside the shell-safe characters _check_alias accepts.
-_ALIAS_KIND = re.compile(r"(dsh-tui|dsh|claude|codex|opencode|pi)-[A-Za-z0-9._-]+")
+_ALIAS_KIND = re.compile(r"(dsh-tui|dsh|claude|codex|opencode|pi|omp)-[A-Za-z0-9._-]+")
 
 
 class _AliasGroup(TyperGroup):
@@ -44,8 +44,8 @@ start_app = typer.Typer(
     "modified unless you ask for it with claude's --global-project-plans. Repeat --url to put "
     "several model servers behind one session proxy; see "
     "<agent> --help. "
-    "A name like claude-<x>, codex-<x>, opencode-<x>, pi-<x>, dsh-<x> or dsh-tui-<x> runs your "
-    "own bash function, alias or script of that name as that agent, through `bash -ic`.",
+    "A name like claude-<x>, codex-<x>, opencode-<x>, pi-<x>, omp-<x>, dsh-<x> or dsh-tui-<x> "
+    "runs your own bash function, alias or script of that name as that agent, through `bash -ic`.",
     no_args_is_help = True,
     context_settings = {"help_option_names": ["-h", "--help"]},
     cls = _AliasGroup,
@@ -84,14 +84,14 @@ _MCP_EPILOG = (
     "Auto-compaction\n"
     "| agent | without --compact-at\n"
     "| claude | at 90% of the window minus the reply reserve\n"
-    "| opencode | keeps max(window/10, 8,192) free, at most the reply cap\n"
-    "| codex, pi, dsh | the agent's own default\n"
+    "| opencode | keeps max(window/10, 8,192) free, up to reply cap\n"
+    "| codex, pi, omp, dsh | the agent's own default\n"
     "| dsh-tui, dst | its agent presets; --compact-at is refused\n"
     "--compact-at R compacts at R of the window (claude: minus the reply\n"
     "reserve); R is 0.5-0.95, and dsh uses it only with --profile headless.\n\n"
     "Reply length\n"
     "| agent | --max-tokens N | unset\n"
-    "| opencode, pi, dsh | N, at most window/2 | window/4, at most 32,000\n"
+    "| opencode, pi, omp, dsh | N, at most window/2 | window/4, at most 32,000\n"
     "| claude, codex | not available | the agent's own limit\n"
     "window = --context-length, else the server's (250,000 if none)\n\n"
     "Examples\n"
@@ -128,6 +128,9 @@ start_app.command(
 start_app.command(
     "pi", cls = _PassthroughCommand, context_settings = _PASSTHROUGH, epilog = _MCP_EPILOG
 )(pi.pi)
+start_app.command(
+    "omp", cls = _PassthroughCommand, context_settings = _PASSTHROUGH, epilog = _MCP_EPILOG
+)(omp.omp)
 start_app.command(
     "dsh", cls = _PassthroughCommand, context_settings = _PASSTHROUGH, epilog = _MCP_EPILOG
 )(dsh.dsh)

@@ -525,6 +525,8 @@ _YOLO_COMMAND_FLAGS = {
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
     # Pi never prompts per tool call; its only approval gate is project trust, so -a (trust project resources) is the closest "do not ask me" equivalent.
     "pi": ["--approve"],
+    # omp's --yolo forces yolo approval (src/cli/args.ts:401).
+    "omp": ["--yolo"],
 }
 
 
@@ -537,6 +539,7 @@ def _yolo_command_flags(agent: str, yolo: bool) -> list:
 _AGENT_FLAG_ALIASES = {
     "codex": {"--yolo": "--dangerously-bypass-approvals-and-sandbox", "-p": "--profile"},
     "pi": {"-a": "--approve"},
+    "omp": {"--auto-approve": "--yolo"},
 }
 
 

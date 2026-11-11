@@ -39,6 +39,12 @@ def _no_local_servers(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_SWITCH_HOME", str(tmp_path / "agent-switch-home"))
 
 
+@pytest.fixture(autouse = True)
+def _no_bun_install(monkeypatch):
+    """The developer's BUN_INSTALL must not add its bin dir to the PATH tests assert on."""
+    monkeypatch.delenv("BUN_INSTALL", raising = False)
+
+
 @pytest.fixture()
 def fake_vllm(tmp_path, monkeypatch):
     """A vLLM-shaped server at BASE that --url tests reach through the request stub."""
