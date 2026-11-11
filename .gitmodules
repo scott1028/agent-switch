@@ -28,3 +28,6 @@
 	url = https://github.com/ccch1mneyyy/dsh-TUI
 	shallow = true
 	branch = main
+[submodule "references/oh-my-pi"]
+	path = references/oh-my-pi
+	url = git@github.com:can1357/oh-my-pi.git
