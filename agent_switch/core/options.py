@@ -306,7 +306,7 @@ _PERSIST_OPTION = typer.Option(
     False,
     "--persist/--no-persist",
     rich_help_panel = _PANEL_SESSION,
-    help = "Keep the session dir so the agent can resume this session.",
+    help = "Keep the session dir between runs (codex needs it to resume).",
 )
 
 

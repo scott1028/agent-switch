@@ -83,7 +83,9 @@ def test_aliases_share_one_isolated_home(agent, fake_vllm, tmp_path):
     _assert_env_set(result.output, "HOME", str(home))
     _assert_env_set(result.output, "USERPROFILE", str(home))
     _assert_env_set(result.output, "DSH_HOME", str(home / ".dsh"))
-    _assert_env_set(result.output, "DSH_TUI_SESSION_ROOT", str(home / ".dsh" / "sessions"))
+    # Sessions go to your own DSH home's store, where native dsh-tui and dsh web keep theirs
+    # (dsh-tui cordis.patch.yml:187-194).
+    _assert_env_set(result.output, "DSH_TUI_SESSION_ROOT", str(Path.home() / ".dsh" / "sessions"))
     _assert_env_set(result.output, "AGENT_SWITCH_API_KEY", KEY)
     _assert_env_set(result.output, "DSH_TELEMETRY_DISABLED", "1")
     assert _tui_command(result.output) == [
@@ -93,12 +95,34 @@ def test_aliases_share_one_isolated_home(agent, fake_vllm, tmp_path):
     ]
 
 
+@pytest.mark.parametrize(("shell", "expected"), [("/my/tui-sessions", "/my/tui-sessions"), ("  ", None)])
+def test_tui_session_root_follows_your_shell(fake_vllm, tmp_path, monkeypatch, shell, expected):
+    monkeypatch.setenv("DSH_TUI_SESSION_ROOT", shell)
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
+    assert result.exit_code == 0, result.output
+    # dsh-tui reads it with ??, so only a blank one falls back (dsh-tui cordis.patch.yml:194).
+    _assert_env_set(result.output, "DSH_TUI_SESSION_ROOT", expected or str(Path.home() / ".dsh" / "sessions"))
+
+
+def test_tui_warns_when_your_profile_patch_sets_the_session_row(fake_vllm, tmp_path, monkeypatch):
+    path = Path.home() / ".dsh" / "profiles" / "dsh-tui" / "cordis.patch.yml"
+    path.parent.mkdir(parents = True)
+    # dsh-tui keeps its own settings row there too (dsh-tui src/tuiSettingsFile.ts:106-109).
+    path.write_text("- id: dsh-tui\n  config:\n    fullscreen: false\n")
+    assert "Warning" not in _invoke("dsh-tui", "--url", BASE, "--no-launch").stderr
+    path.write_text("- id: session-persistence-jsonl\n  config:\n    root: /elsewhere\n")
+    result = _invoke("dsh-tui", "--url", BASE, "--no-launch")
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.stderr and str(path) in result.stderr
+
+
 def test_patch_pins_route_model_and_backend_in_the_tui_row(fake_vllm, tmp_path):
     result = _invoke("dsh-tui", "--url", BASE, "--no-launch", "--header", "X-Test=1", "--reasoning-effort", "low")
     assert result.exit_code == 0, result.output
     text = (_home(tmp_path) / dsh_agent._DSH_PATCH_FILE).read_text()
     ids = [dict((k.value, v) for k, v in row.value)["id"].value for row in yaml.compose(text).value]
-    assert ids == ["llm-pi-ai", "agent-default-model", "dsh-tui"]
+    # dsh-tui's own profile row reads DSH_TUI_SESSION_ROOT, so only the image store is re-pointed.
+    assert ids == ["llm-pi-ai", "agent-default-model", "attachment-local", "dsh-tui"]
     assert "X-Test" in text and "chatTemplateKwargs" in text
     row = _tui_row(text)
     plain = {name: node.value for name, node in row.items() if node.tag != _JS_TAG}

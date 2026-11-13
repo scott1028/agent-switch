@@ -146,7 +146,7 @@ _DSH_PERSIST_OPTION = typer.Option(
     None,
     "--persist/--no-persist",
     rich_help_panel = _PANEL_SESSION,
-    help = "Keep the session dir for -- --resume (dsh-tui: on by default; dsh: off).",
+    help = "Keep the session dir between runs (dsh-tui: on by default; dsh: off).",
 )
 
 
@@ -390,8 +390,10 @@ def write_dsh_patch(
     mcp_servers: Optional[dict] = None,
     served_models: Optional[list] = None,
     skills_root: Optional[str] = None,
+    session_home: Optional[Path] = None,
 ) -> None:
-    """Write the dsh loader patch that points the booted profile at the model server.
+    """Write the dsh loader patch that points the booted profile at the model server, and with
+    session_home (the user's own DSH home) its session log and image store there.
 
     dsh 0.1.7 dropped `settings.yaml`: it now imports a leftover one into the profile only
     after the first boot has settled, so that boot still runs on the DeepSeek default. A
@@ -452,6 +454,21 @@ def write_dsh_patch(
                 "config": {"thresholdRatio": compact_at},
             }
         )
+    if session_home is not None:
+        # The base layer's session log and image store under the user's own DSH home, so native
+        # dsh and this session resume each other's sessions, images included
+        # (references/deepseek-harness/packages/bundle/base/cordis.patch.yml:138-147). A patch row
+        # replaces its row's whole config (deepseek-harness docs/architecture.md:25), and neither
+        # base row has another key. dsh-tui's own profile row reads DSH_TUI_SESSION_ROOT instead
+        # (references/dsh-tui/cordis.patch.yml:187-194), which the launch sets.
+        if not is_tui:
+            entries.append({
+                "id": "session-persistence-jsonl",
+                "config": {"root": str(session_home / "sessions")},
+            })
+        # Omitted, attachment-local follows DSH_HOME, the session's
+        # (deepseek-harness packages/attachment/attachment-local/src/index.ts:66-67,179-181).
+        entries.append({"id": "attachment-local", "config": {"dshHome": str(session_home)}})
     if mcp_servers:
         # A row without `insert` only patches an existing plugin id (the include loader warns
         # "entry not found" and skips it), so the mounted servers go through one insert row.
@@ -695,8 +712,6 @@ def _get_dsh_tui_env(home: Path) -> dict:
     env = {
         "HOME": str(home),
         "USERPROFILE": str(home),
-        # Read with ??, so an inherited root would move session records out of DSH_HOME.
-        "DSH_TUI_SESSION_ROOT": str(home / ".dsh" / "sessions"),
         # Pairs with the row's backend: dsh; the launcher's bare --resume and crash retry read it.
         "DSH_TUI_BACKEND": "dsh",
         "PNPM_HOME": str(pnpm_home),
@@ -753,6 +768,39 @@ def _get_dsh_source_home(dsh_home: Path) -> Path:
         # Do not treat this session as its own resource source.
         return Path.home() / ".dsh"
     return source
+
+
+def _warn_dsh_user_session_rows(source_home: Path, profile: Optional[str]) -> None:
+    """Warn when the user's own patch layers set the session rows this session re-points."""
+    import yaml
+
+    class _PatchLoader(yaml.SafeLoader):
+        pass
+
+    # !!js and other tags only need to load, not run.
+    _PatchLoader.add_multi_constructor("", lambda loader, suffix, node: None)
+    # The tweak layers dsh applies after every bundle layer, the profile's first
+    # (references/deepseek-harness/packages/boot/app-boot/README.md:61).
+    paths = [source_home / "cordis.patch.yml"]
+    if profile:
+        paths.insert(0, source_home / "profiles" / profile / "cordis.patch.yml")
+    found = []
+    for path in paths:
+        try:
+            rows = yaml.load(path.read_text(encoding = "utf-8"), Loader = _PatchLoader)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            continue
+        for row in rows if isinstance(rows, list) else []:
+            row_id = row.get("id") if isinstance(row, dict) else None
+            if row_id in ("session-persistence-jsonl", "attachment-local"):
+                found.append(f"{row_id} in {path}")
+    if found:
+        typer.echo(
+            f"Warning: your own patch sets {', '.join(found)}; this session does not follow your "
+            "settings for those rows (root, compression, dshHome), so it may not see or open "
+            "sessions your own dsh writes elsewhere.",
+            err = True,
+        )
 
 
 def _check_dsh_tui_skills(dsh_home: Path, home: Path, *, is_native: bool) -> None:
@@ -1057,6 +1105,17 @@ def dsh(
                 f"Note: {probe} runs as a Windows program, so injected skills are copied; "
                 "restart to pick up edits."
             )
+        # Native dsh keeps its history in the user's DSH home, so this session keeps it there too.
+        session_home = _get_dsh_source_home(dsh_home)
+        if not is_tui and _wsl_windows_executable(["dsh"]):
+            # A Windows dsh would need the WSL paths translated, and its write locks are named by
+            # path, so it keeps its own history (a Windows dsh-tui is refused from WSL above).
+            session_home = None
+            typer.echo(
+                "Warning: dsh runs as a Windows program here, so this session keeps its own "
+                "history instead of sharing yours.",
+                err = True,
+            )
         patch = home / _DSH_PATCH_FILE
         write_dsh_patch(
             base,
@@ -1071,6 +1130,7 @@ def dsh(
             mcp_servers = mcp_servers,
             served_models = served_models,
             skills_root = _agent_config_path(skills_root, [probe]) if skills else None,
+            session_home = session_home,
         )
         # A Windows dsh under WSL gets DSH_HOME translated through WSLENV, but not argv.
         if is_tui:
@@ -1085,6 +1145,10 @@ def dsh(
                 "Use --profile headless to apply it.",
                 err = True,
             )
+        if session_home is not None:
+            # dsh-tui boots the dsh-tui profile (references/dsh-tui/src/tuiSettingsFile.ts:106-109).
+            profile = "dsh-tui" if is_tui else _get_dsh_boot_profile(command)
+            _warn_dsh_user_session_rows(session_home, profile)
         write_dsh_user_resources(dsh_home, is_tui = is_tui)
         env = {
             _DSH_ENV_KEY: key,
@@ -1101,6 +1165,12 @@ def dsh(
             # A saved /model pick wins over the patch row's provider/model, so drop it each launch.
             (home / ".dsh-tui" / "model.json").unlink(missing_ok = True)
             env.update(_get_dsh_tui_env(home))
+            # dsh-tui reads it with ??, so a blank shell value would count as set
+            # (references/dsh-tui/cordis.patch.yml:192-194); the user's own wins otherwise.
+            shell_root = os.environ.get("DSH_TUI_SESSION_ROOT") or ""
+            if not shell_root.strip():
+                shell_root = str(session_home / "sessions")
+            env["DSH_TUI_SESSION_ROOT"] = shell_root
             child_path = _get_dsh_tui_child_path(home, harness) if harness else None
             if child_path:
                 env["PATH"] = child_path

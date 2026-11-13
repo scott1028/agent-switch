@@ -132,6 +132,18 @@ def test_write_dsh_patch_fresh(dsh_patch):
     }
 
 
+def test_write_dsh_patch_points_the_session_rows_at_your_dsh_home(dsh_patch, tmp_path):
+    user_dsh = tmp_path / "user-home" / ".dsh"
+    dsh_agent.write_dsh_patch(BASE, MODEL, dsh_patch, session_home = user_dsh)
+    entries = _dsh_entries(dsh_patch)
+    # A patch row replaces its row's whole config (deepseek-harness docs/architecture.md:25), and
+    # neither base row carries another key (packages/bundle/base/cordis.patch.yml:138-147).
+    assert entries["session-persistence-jsonl"] == {
+        "id": "session-persistence-jsonl", "config": {"root": str(user_dsh / "sessions")},
+    }
+    assert entries["attachment-local"] == {"id": "attachment-local", "config": {"dshHome": str(user_dsh)}}
+
+
 def test_write_dsh_patch_without_window_omits_limits(dsh_patch):
     dsh_agent.write_dsh_patch(BASE, {"id": "org/unknown-window"}, dsh_patch)
     provider = _dsh_entries(dsh_patch)["llm-pi-ai"]["config"]["providers"]["agent-switch"]
@@ -290,6 +302,62 @@ def test_connect_dsh_no_launch(fake_vllm, tmp_path):
     assert entries["llm-pi-ai"]["config"]["providers"]["agent-switch"]["baseURL"] == f"{BASE}/v1"
     # dsh 0.1.7 imports a settings.yaml into the profile only after boot, so none is written.
     assert not (home / "settings.yaml").exists()
+
+
+@pytest.mark.parametrize("is_configured", [False, True])
+def test_dsh_url_keeps_its_history_in_your_dsh_home(fake_vllm, tmp_path, monkeypatch, is_configured):
+    user_home = _dsh_user_home(tmp_path, monkeypatch)
+    user_dsh = user_home / ".dsh"
+    if is_configured:
+        user_dsh = tmp_path / "custom-dsh"
+        monkeypatch.setenv("DSH_HOME", str(user_dsh))
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    home = tmp_path / "agents" / "dsh"
+    entries = _dsh_entries(home / dsh_agent._DSH_PATCH_FILE)
+    assert entries["session-persistence-jsonl"]["config"] == {"root": str(user_dsh / "sessions")}
+    assert entries["attachment-local"]["config"] == {"dshHome": str(user_dsh)}
+    # Profiles, plugins and credentials stay in the session's own DSH_HOME.
+    _assert_env_set(result.output, "DSH_HOME", str(home))
+    # dsh makes the root on its first write (session-persistence-jsonl/src/index.ts:96-101).
+    assert not user_dsh.exists()
+
+
+@pytest.mark.parametrize(("where", "row", "is_warned"), [
+    ("home", "session-persistence-jsonl", True),
+    ("profile", "attachment-local", True),
+    # Another profile's layer, a row the session leaves alone, and a file dsh itself would reject.
+    ("other-profile", "session-persistence-jsonl", False),
+    ("home", "skill-filesystem", False),
+    ("home", None, False),
+])
+def test_dsh_url_warns_when_your_patch_sets_the_session_rows(fake_vllm, tmp_path, monkeypatch, where, row, is_warned):
+    user_dsh = _dsh_user_home(tmp_path, monkeypatch) / ".dsh"
+    # Your tweak layers, applied after every bundle layer (deepseek-harness
+    # packages/boot/app-boot/README.md:61); the session's own DSH_HOME never reads them.
+    path = {
+        "home": user_dsh / "cordis.patch.yml",
+        "profile": user_dsh / "profiles" / "web" / "cordis.patch.yml",
+        "other-profile": user_dsh / "profiles" / "headless" / "cordis.patch.yml",
+    }[where]
+    path.parent.mkdir(parents = True)
+    path.write_text(
+        f"- id: {row}\n  config:\n    root: !!js process.env.MY_ROOT ?? '/x'\n    compression: none\n"
+        if row else "- id: [unclosed\n"
+    )
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert ("Warning" in result.stderr and str(path) in result.stderr) == is_warned, result.stderr
+
+
+def test_dsh_url_keeps_its_own_history_for_a_windows_dsh_under_wsl(fake_vllm, tmp_path, monkeypatch):
+    set_start_attr(monkeypatch, "_wsl_windows_executable", lambda _: "/mnt/c/npm/dsh.cmd")
+    set_start_attr(monkeypatch, "_wsl_windows_path", str)
+    result = CliRunner().invoke(start.start_app, ["dsh", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    entries = _dsh_entries(tmp_path / "agents" / "dsh" / dsh_agent._DSH_PATCH_FILE)
+    assert "session-persistence-jsonl" not in entries and "attachment-local" not in entries
+    assert "history" in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")

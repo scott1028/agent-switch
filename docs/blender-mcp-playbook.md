@@ -86,9 +86,12 @@ agent-switch <agent> --url http://127.0.0.1:19090 \
 - Your `~/.profile` must not print anything: stdout is the MCP connection.
 - `blender=` names the server; without it the name would be `blender-mcp`.
 - Only if you changed the add-on's port: add `--mcp-env 'blender:BLENDER_MCP_PORT=<port>'`.
-- dsh-tui and dst keep their session folder by default (settings, history and the installed
-  profile survive). `--no-persist` is optional: it uses a throwaway folder and reinstalls the TUI
-  profile with pnpm on every start. The test used it only to leave the saved session alone.
+- dsh-tui and dst keep their session folder by default (settings and the installed profile
+  survive). Session history always goes to your own store (`DSH_TUI_SESSION_ROOT`, or `sessions`
+  in your DSH home), with or without `--no-persist`. To keep a test session apart, set
+  `DSH_TUI_SESSION_ROOT` to another folder in your shell first; the shell's value wins.
+  `--no-persist` is optional: it uses a throwaway folder and reinstalls the TUI profile with pnpm
+  on every start.
 
 The tested commands:
 

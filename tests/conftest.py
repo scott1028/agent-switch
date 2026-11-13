@@ -40,6 +40,19 @@ def _no_local_servers(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse = True)
+def _isolated_home(monkeypatch, tmp_path):
+    """No test may link into or create session stores under the developer's real HOME."""
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(tmp_path / "isolated-home"))
+    for name in (
+        "CODEX_HOME", "CODEX_SQLITE_HOME", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE", "DSH_HOME", "DSH_TUI_SESSION_ROOT",
+        "XDG_DATA_HOME", "XDG_STATE_HOME",
+    ):
+        monkeypatch.delenv(name, raising = False)
+
+
+@pytest.fixture(autouse = True)
 def _no_bun_install(monkeypatch):
     """The developer's BUN_INSTALL must not add its bin dir to the PATH tests assert on."""
     monkeypatch.delenv("BUN_INSTALL", raising = False)

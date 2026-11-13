@@ -28,7 +28,6 @@ from tests.cli_support import (
     MODEL,
     _SESSION_FLAGS,
     _assert_env_set,
-    _assert_env_unset,
     _assert_windows_agent_copies_injected_skills,
     _launch_command,
     _mcp_registry,
@@ -58,6 +57,8 @@ def pi_skill_sources(tmp_path, monkeypatch):
         (child / "SKILL.md").write_text(f"---\nname: {name}\n---\nUSER\n")
     (agent_dir / "extensions").mkdir()
     (agent_dir / "extensions" / "mine.ts").write_text("export default () => {};\n")
+    # A first run creates it; here it exists, so the snapshot shows nothing else changes.
+    (agent_dir / "sessions").mkdir()
     (agent_dir / "auth.json").write_text('{"user-provider": "user-key"}\n')
     (agent_dir / "models.json").write_text('{"providers": {"user-provider": {}}}\n')
     (agent_dir / "settings.json").write_text(json.dumps({
@@ -280,17 +281,21 @@ def _pi_user_agent_dir(tmp_path, monkeypatch) -> Path:
     return agent_dir
 
 
+@pytest.mark.parametrize("value", ["absolute", "~/user-sessions"])
 @pytest.mark.parametrize("routed", [True, False])
-def test_pi_session_dir_env_is_cleared_only_for_the_url_session(routed, fake_vllm, tmp_path, monkeypatch):
-    # Pi stores sessions in $PI_CODING_AGENT_SESSION_DIR before its agent dir, which a --url
-    # session moves; native launch keeps the user's own.
-    _pi_user_agent_dir(tmp_path, monkeypatch)
-    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "user-sessions"))
+def test_pi_session_dir_env_reaches_the_url_session(routed, value, fake_vllm, tmp_path, monkeypatch):
+    # Pi stores sessions in $PI_CODING_AGENT_SESSION_DIR first (src/main.ts:691-695), so the
+    # session writes where your own pi does; native launch leaves it alone.
+    user_home = _pi_user_agent_dir(tmp_path, monkeypatch).parent.parent
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "user-sessions") if value == "absolute" else value)
     args = ["pi", "--url", BASE, "--no-launch"] if routed else ["pi", "--no-launch"]
     result = CliRunner().invoke(start.start_app, args)
     assert result.exit_code == 0, result.output
     if routed:
-        _assert_env_unset(result.output, "PI_CODING_AGENT_SESSION_DIR")
+        # Pi expands ~ against HOME, which moved (src/utils/paths.ts:88-94).
+        expected = tmp_path / "user-sessions" if value == "absolute" else user_home / "user-sessions"
+        _assert_env_set(result.output, "PI_CODING_AGENT_SESSION_DIR", str(expected))
+        assert "unset PI_CODING_AGENT_SESSION_DIR" not in result.output
     else:
         assert "PI_CODING_AGENT_SESSION_DIR" not in result.output
 
@@ -466,8 +471,10 @@ def test_write_pi_user_resources_links_resources_and_keeps_config_private(tmp_pa
     assert (session_home / ".agents" / "skills").resolve() == (
         user_home / ".agents" / "skills"
     ).resolve()
-    for private in ("auth.json", "sessions"):
-        assert not (agent_dir / private).exists()
+    assert not (agent_dir / "auth.json").exists()
+    # Your own history, so native pi and this session resume each other's sessions.
+    assert (agent_dir / "sessions").is_symlink()
+    assert (agent_dir / "sessions").resolve() == (user_agent_dir / "sessions").resolve()
     assert "mine" not in json.loads((agent_dir / "models.json").read_text())["providers"]
     settings = json.loads((agent_dir / "settings.json").read_text())
     assert settings == {
@@ -527,6 +534,70 @@ def test_write_pi_user_resources_refreshes_a_persisted_session(tmp_path, monkeyp
         "theme": "dark",
     }
     assert not (agent_dir / pi_agent._PI_USER_RESOURCES_MANIFEST).exists()
+
+
+def test_write_pi_user_resources_copies_the_session_dir_setting(tmp_path, monkeypatch):
+    user_agent_dir = _pi_user_agent_dir(tmp_path, monkeypatch)
+    user_home = user_agent_dir.parent.parent
+    user_settings = user_agent_dir / "settings.json"
+    session_home = tmp_path / "session"
+    agent_dir = session_home / ".pi" / "agent"
+    settings_path = agent_dir / "settings.json"
+
+    def run(user_value):
+        user_settings.write_text(json.dumps({} if user_value is None else {"sessionDir": user_value}))
+        pi_agent.write_pi_user_resources(agent_dir, session_home)
+        return json.loads(settings_path.read_text()).get("sessionDir") if settings_path.exists() else None
+
+    # Pi expands ~ against HOME, which moved (src/utils/paths.ts:88-94).
+    assert run("~/pi-sessions") == str(user_home / "pi-sessions")
+    assert run("rel/sessions") == "rel/sessions"
+    # Gone with your own setting.
+    assert run(None) is None
+    # A value set inside the session wins.
+    settings = json.loads(settings_path.read_text())
+    settings_path.write_text(json.dumps({**settings, "sessionDir": "/mine"}))
+    assert run("/yours") == "/mine"
+
+
+@pytest.mark.parametrize(("value", "is_expanded"), [("~/pi-sessions", True), ("/abs/sessions", False), ("rel/sessions", False)])
+@pytest.mark.parametrize("launch", [True, False])
+def test_pi_url_expands_a_project_session_dir_against_your_home(fake_vllm, tmp_path, monkeypatch, value, is_expanded, launch):
+    user_home = _pi_user_agent_dir(tmp_path, monkeypatch).parent.parent
+    project = tmp_path / "project"
+    (project / ".pi").mkdir(parents = True)
+    (project / ".pi" / "settings.json").write_text(json.dumps({"sessionDir": value}))
+    monkeypatch.chdir(project)
+    captured = {}
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/pi")
+    monkeypatch.setattr(subprocess, "run", lambda command, env: captured.update(env = env) or SimpleNamespace(returncode = 0))
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, *([] if launch else ["--no-launch"])])
+    assert result.exit_code == 0, result.output
+    expanded = str(user_home / "pi-sessions")
+    if launch:
+        # Pi would expand ~ against HOME, which moved (src/core/settings-manager.ts:690-693), and
+        # reads the env before its settings (src/main.ts:691-695). Absolute and relative values
+        # it resolves the same either way.
+        assert captured["env"].get("PI_CODING_AGENT_SESSION_DIR") == (expanded if is_expanded else None)
+    else:
+        # A recipe may run in another project, so it never carries this one's value.
+        assert "PI_CODING_AGENT_SESSION_DIR" not in result.stdout
+        assert (expanded in result.stderr) == is_expanded
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_pi_url_moves_a_persisted_session_history_aside(fake_vllm, tmp_path, monkeypatch, capsys):
+    user_agent_dir = _pi_user_agent_dir(tmp_path, monkeypatch)
+    agent_dir = tmp_path / "agents" / "pi" / ".pi" / "agent"
+    (agent_dir / "sessions" / "--project--").mkdir(parents = True)
+    (agent_dir / "sessions" / "--project--" / "old.jsonl").write_text("old\n")
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE, "--no-launch", "--persist"])
+    assert result.exit_code == 0, result.output
+    # The first run creates your own sessions dir, and the session links it.
+    assert (agent_dir / "sessions").resolve() == user_agent_dir / "sessions"
+    moved = agent_dir / "sessions.agent-switch-old"
+    assert (moved / "--project--" / "old.jsonl").read_text() == "old\n"
+    assert str(moved) in result.output
 
 
 def test_write_pi_user_resources_leaves_session_dirs_and_user_files_alone(tmp_path, monkeypatch):
@@ -599,7 +670,7 @@ def test_link_user_dir_replaces_a_junction_from_an_earlier_run(tmp_path, monkeyp
     assert target.resolve() == source.resolve()
 
 
-def test_write_pi_user_resources_skips_a_windows_pi_under_wsl(tmp_path, monkeypatch):
+def test_write_pi_user_resources_skips_a_windows_pi_under_wsl(tmp_path, monkeypatch, capsys):
     user_agent_dir = _pi_user_agent_dir(tmp_path, monkeypatch)
     (user_agent_dir / "extensions").mkdir()
     (user_agent_dir / "settings.json").write_text(json.dumps({"packages": ["npm:pi-mine"]}))
@@ -610,6 +681,9 @@ def test_write_pi_user_resources_skips_a_windows_pi_under_wsl(tmp_path, monkeypa
     pi_agent.write_pi_user_resources(agent_dir, session_home)
 
     assert not agent_dir.exists()
+    # Windows pi cannot follow a WSL link, so the session keeps its own history, and says so.
+    assert not (user_agent_dir / "sessions").exists()
+    assert "history" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks and path forms")
@@ -626,6 +700,7 @@ def test_write_pi_user_resources_clears_a_session_a_linux_pi_prepared(tmp_path, 
     set_start_attr(monkeypatch, "_wsl_windows_executable", lambda _: None)
     pi_agent.write_pi_user_resources(agent_dir, session_home)
     assert (agent_dir / "extensions").is_symlink()
+    assert (agent_dir / "sessions").is_symlink()
     # Something the session set for itself, which must survive.
     settings = json.loads((agent_dir / "settings.json").read_text())
     settings["packages"].append("npm:session-only")
@@ -635,6 +710,8 @@ def test_write_pi_user_resources_clears_a_session_a_linux_pi_prepared(tmp_path, 
     pi_agent.write_pi_user_resources(agent_dir, session_home)
 
     assert not (agent_dir / "extensions").exists()
+    assert not os.path.lexists(agent_dir / "sessions")
+    assert (user_agent_dir / "sessions").is_dir()
     assert json.loads((agent_dir / "settings.json").read_text()) == {
         "packages": ["npm:session-only"],
     }
@@ -941,6 +1018,24 @@ def test_connect_pi_wsl_windows_shim_relocates_userprofile(fake_vllm, monkeypatc
     assert "USERPROFILE/p" in wslenv
 
 
+def test_connect_pi_wsl_windows_pi_keeps_its_own_session_dir(fake_vllm, monkeypatch):
+    captured = {}
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    # Meant for a Linux pi; the WSLENV bridge would hand it to the Windows one.
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", "~/linux-pi-sessions")
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/mnt/c/Users/x/AppData/Roaming/npm/pi")
+
+    def run(command, env):
+        captured["env"] = env
+        return SimpleNamespace(returncode = 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result = CliRunner().invoke(start.start_app, ["pi", "--url", BASE])
+    assert result.exit_code == 0, result.output
+    # The Windows pi keeps its own history, as its note says.
+    assert not captured["env"].get("PI_CODING_AGENT_SESSION_DIR")
+
+
 # ── --mcp / --mcp-all: session-only MCP mounting ─────────────────────
 
 
@@ -1153,7 +1248,7 @@ def test_native_pi_skill_overlay_preserves_config_and_filters_names(fake_vllm, t
     _assert_env_set(result.output, "PI_CODING_AGENT_DIR", str(overlay))
     assert "export HOME=" not in result.output and "USERPROFILE" not in result.output
     assert _launch_command(result.output) == ["pi"]
-    for name in ["auth.json", "models.json", "settings.json", "extensions"]:
+    for name in ["auth.json", "models.json", "settings.json", "extensions", "sessions"]:
         assert (overlay / name).is_symlink()
         assert (overlay / name).resolve() == user_agent / name
     assert not (overlay / "skills").is_symlink()
@@ -1167,6 +1262,34 @@ def test_native_pi_skill_overlay_preserves_config_and_filters_names(fake_vllm, t
     assert _launch_command(cleared.output) == ["pi"]
     assert not overlay.exists()
     assert _get_skill_snapshot(user_agent) == before_user_agent
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_native_pi_skill_overlay_links_your_sessions_before_you_have_any(fake_vllm, tmp_path, monkeypatch):
+    user_agent = _pi_user_agent_dir(tmp_path, monkeypatch)
+    _native_no_connect_pi(monkeypatch)
+    source = tmp_path / "injected"
+    source.mkdir()
+    (source / "SKILL.md").write_text("---\nname: injected\n---\n")
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch", "--skill", str(source)])
+    assert result.exit_code == 0, result.output
+    overlay = tmp_path / "agents" / "pi-native" / "agent"
+    # So pi's first session lands in your history, not in the overlay.
+    assert (overlay / "sessions").is_symlink()
+    assert (overlay / "sessions").resolve() == user_agent / "sessions"
+
+
+def test_native_pi_moves_real_sessions_aside_when_the_overlay_goes(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect_pi(monkeypatch)
+    overlay = tmp_path / "agents" / "pi-native" / "agent"
+    # Sessions pi wrote into a fixed --skill overlay before it linked yours.
+    (overlay / "sessions" / "--project--").mkdir(parents = True)
+    (overlay / "sessions" / "--project--" / "s.jsonl").write_text("old\n")
+    (overlay / "auth.json").write_text("{}\n")
+    result = CliRunner().invoke(start.start_app, ["pi", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert (overlay / "sessions.agent-switch-old" / "--project--" / "s.jsonl").read_text() == "old\n"
+    assert os.listdir(overlay) == ["sessions.agent-switch-old"]
 
 
 def test_native_pi_skill_set_injects_nested_skills(fake_vllm, tmp_path, monkeypatch, pi_skill_sources):
@@ -1237,6 +1360,8 @@ def test_pi_skill_windows_resource_skip_clears_owned_entries(tmp_path, monkeypat
 
 def test_persisted_pi_skill_injection_preserves_unowned_session_skills(fake_vllm, tmp_path, monkeypatch):
     user_agent = _pi_user_agent_dir(tmp_path, monkeypatch)
+    # A first run creates it; here it exists, so the snapshot shows nothing else changes.
+    (user_agent / "sessions").mkdir()
     before = _get_skill_snapshot(user_agent)
     args = ["pi", "--url", BASE, "--persist", "--no-launch"]
     baseline = CliRunner().invoke(start.start_app, args)

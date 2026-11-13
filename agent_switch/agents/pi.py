@@ -27,7 +27,7 @@ from agent_switch.core.launch import (
     _run_native,
 )
 from agent_switch.core.mcp import load_mcp_servers
-from agent_switch.core.overlay import write_native_overlay
+from agent_switch.core.overlay import link_user_store, remove_native_overlay, write_native_overlay
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -332,6 +332,16 @@ def _write_pi_mcp_config(path: Path, servers: dict, *, should_escape: bool = Fal
     )
 
 
+def _expand_pi_home(path: str, home: Path) -> str:
+    """path with a leading ~ expanded against home, as pi expands it against its own HOME
+    (packages/coding-agent/src/utils/paths.ts:88-94), which a --url session moves."""
+    if path == "~":
+        return str(home)
+    if path.startswith("~/") or (os.name == "nt" and path.startswith("~\\")):
+        return os.path.join(home, path[2:])
+    return path
+
+
 def _link_user_dir(source: Path, target: Path) -> bool:
     """Expose source at target. True once target resolves to source."""
     # Refresh links, but preserve real session directories.
@@ -435,7 +445,7 @@ def _pi_settings_entries(
 
 def _clear_pi_user_resources(agent_dir: Path, home: Path) -> None:
     """Undo what an earlier launch linked and copied, leaving session state alone."""
-    targets = [agent_dir / name for name in _PI_USER_RESOURCE_DIRS]
+    targets = [agent_dir / name for name in (*_PI_USER_RESOURCE_DIRS, "sessions")]
     targets.append(home / ".agents" / "skills")
     for target in targets:
         if target.is_symlink() or _is_junction(target):
@@ -496,6 +506,10 @@ def write_pi_user_resources(agent_dir: Path, home: Path, *, skills: Optional[dic
         _clear_pi_user_resources(agent_dir, home)
         if skills is not None:
             write_skills_overlay(skills_root, None, skills, should_copy = True)
+        typer.echo(
+            "Note: pi runs as a Windows program, which can't follow links into WSL, so this "
+            "session keeps its own history instead of sharing yours."
+        )
         return
     user_home = Path.home()
     source = _get_pi_source_agent_dir(agent_dir)
@@ -506,6 +520,15 @@ def write_pi_user_resources(agent_dir: Path, home: Path, *, skills: Optional[dic
             f"Warning: PI_CODING_AGENT_DIR points at {source}, which is not a directory; "
             "no Pi extensions or packages will load in this session.",
             err = True,
+        )
+    # Pi keeps its sessions in <agentDir>/sessions (src/core/session-manager.ts:589-594), so
+    # link the user's own: native pi and this session then resume each other's sessions.
+    agent_dir.mkdir(parents = True, exist_ok = True, mode = 0o700)
+    if not link_user_store(source / "sessions", agent_dir / "sessions"):
+        _fail(
+            f"Couldn't link your pi {source / 'sessions'} into the session "
+            f"({agent_dir / 'sessions'}), and agent-switch never copies session history; fix "
+            "that and re-run."
         )
     if skills is not None:
         write_skills_overlay(skills_root, source / "skills", skills)
@@ -592,6 +615,17 @@ def write_pi_user_resources(agent_dir: Path, home: Path, *, skills: Optional[dic
             copied[key] = value
         else:
             settings.pop(key, None)
+    # Your own sessionDir keeps the session's history with yours (docs/settings.md:66, read by
+    # src/core/settings-manager.ts:690-693); a relative one resolves from the launch dir for both.
+    value = user_settings.get("sessionDir")
+    own = settings.get("sessionDir")
+    if own is None or own == previous.get("sessionDir"):
+        if isinstance(value, str) and value:
+            value = _expand_pi_home(value, user_home)
+            settings["sessionDir"] = value
+            copied["sessionDir"] = value
+        else:
+            settings.pop("sessionDir", None)
     if json.dumps(settings, sort_keys = True) != before:
         _write_private_json(settings_path, settings)
     if copied != previous:
@@ -741,10 +775,13 @@ def pi(
                 write_native_overlay(
                     agent_dir, _get_pi_source_agent_dir(agent_dir), skills = skills,
                     should_copy_skills = should_copy_skills,
+                    # A Windows pi from WSL can't follow these links (write_pi_user_resources).
+                    shared = () if should_copy_skills else ("sessions",),
                 )
                 env["PI_CODING_AGENT_DIR"] = str(agent_dir)
             else:
-                _remove_overlay_entry(config / "agent")
+                # Sessions pi wrote into an earlier overlay are moved aside, never removed.
+                remove_native_overlay(config / "agent", shared = ("sessions",))
             mcp_path = config / "mcp.json"
             mcp_flags = []
             if mcp_servers:
@@ -897,6 +934,34 @@ def pi(
         else:
             mcp_path.unlink(missing_ok = True)
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}
+        # Pi picks PI_CODING_AGENT_SESSION_DIR over the sessionDir setting and <agentDir>/sessions
+        # (src/main.ts:691-695), and expands its ~ against HOME, which moved.
+        unset_env = ()
+        session_dir = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+        if _wsl_windows_executable(["pi"]):
+            # A Windows pi keeps its own history (write_pi_user_resources); a shell value is
+            # meant for a Linux pi.
+            unset_env = ("PI_CODING_AGENT_SESSION_DIR",)
+        elif session_dir:
+            env["PI_CODING_AGENT_SESSION_DIR"] = _expand_pi_home(session_dir, Path.home())
+        else:
+            # The project's sessionDir wins over the copied global one (src/core/
+            # settings-manager.ts:306,335,690-693); only one with ~ needs the user's home.
+            project_path = Path.cwd() / ".pi" / "settings.json"
+            project_dir = (_read_json_object(project_path) or {}).get("sessionDir")
+            if isinstance(project_dir, str) and project_dir.startswith("~"):
+                expanded = _expand_pi_home(project_dir, Path.home())
+                if launch:
+                    env["PI_CODING_AGENT_SESSION_DIR"] = expanded
+                else:
+                    # A recipe may run in another project, so it never carries this one's value.
+                    typer.echo(
+                        f"Note: {project_path} sets sessionDir {project_dir!r}, and the session's "
+                        "pi reads its ~ against the moved HOME; before you run this recipe, "
+                        f"export PI_CODING_AGENT_SESSION_DIR={expanded} in your shell, or make "
+                        "that sessionDir absolute.",
+                        err = True,
+                    )
         if os.name == "nt" or os.environ.get("WSL_DISTRO_NAME"):
             # Node resolves ~/.pi via USERPROFILE (then HOMEDRIVE + HOMEPATH) on Windows, not HOME. Set them whenever Pi may run as a Windows process: native Windows, or a /mnt Windows shim launched from WSL, where the WSLENV bridge then translates the path. Otherwise the Windows process falls back to the user's real %USERPROFILE%\\.pi. splitdrive yields no drive off a POSIX path, so HOMEDRIVE/HOMEPATH stay unset there.
             env["USERPROFILE"] = str(home)
@@ -912,6 +977,5 @@ def pi(
             launch = launch,
             install_hint = install_hint,
             clear_screen = True,
-            # Pi picks this over <agentDir>/sessions, so an inherited one escapes the session home.
-            unset_env = ("PI_CODING_AGENT_SESSION_DIR",),
+            unset_env = unset_env,
         )

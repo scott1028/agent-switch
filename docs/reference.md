@@ -102,6 +102,17 @@ agent-switch opencode --url a:http://127.0.0.1:8080 --url b:http://127.0.0.1:114
   The session cannot see the profiles, plugins or DeepSeek API key in your `~/.dsh`.
 - Exception: `AGENTS.md` and `skills/` from your DSH home (`$DSH_HOME` or `~/.dsh`) are linked into
   the session and read through the link.
+- Your session history is shared: the session's patch points dsh's session log
+  (`session-persistence-jsonl`) at `sessions` in your DSH home and its image store
+  (`attachment-local`) at your DSH home, so either side resumes the other's sessions, images
+  included. Nothing is created there before dsh writes its first session. A Windows dsh run from
+  WSL keeps its own history instead, with a warning.
+- The session does not read your own patch layers (`cordis.patch.yml` in your DSH home and in the
+  profile's folder there). When one of them sets the `session-persistence-jsonl` or
+  `attachment-local` row, for example another `root`, a `compression` or a `dshHome`, agent-switch
+  warns: the session keeps to `sessions` in your DSH home with the default settings, so it may not
+  see or open sessions your own dsh writes elsewhere. This applies to dsh-tui's `dsh-tui` profile
+  folder too.
 - dsh replaces any `User-Agent` you pass with `--header`.
 - `--as-subagent` is not supported for dsh.
 
@@ -110,15 +121,22 @@ with 0.14.0 on dsh 0.1.5-rc.2 and 0.2.0-rc.2) on the same route. Both names shar
 
 - The TUI keeps its state in `~/.dsh-tui`, so `HOME` and `USERPROFILE` move to the session folder
   together with `DSH_HOME`, and pnpm's store and cache stay inside it. Your own dsh and dsh-tui
-  profiles, accounts, history and pnpm store are neither read nor written.
+  profiles, accounts, TUI state and pnpm store are neither read nor written; your dsh `storages/`
+  and `~/.dsh-tui` stay apart too.
+- Session history is shared: `DSH_TUI_SESSION_ROOT` is your shell's value when it is not blank,
+  else `sessions` in your DSH home, the store native dsh-tui and dsh web share. The image store
+  points at your DSH home as for dsh. After you open a session made with another provider, pick
+  this route's model with `/model`.
 - The same `AGENTS.md` and `skills/` links apply. Because `HOME` moves, `~/.agents/skills` and
   `~/.agents/AGENTS.md` are not visible: put such skills in `~/.dsh/skills` and such instructions
   in `~/.dsh/AGENTS.md`, or either in the project.
 - The session folder (`~/.agent-switch/agents/dsh-tui`) is kept by default. Settings changed with
-  `/settings`, the TUI's preferences, history and the installed profile survive between runs, and
-  `-- --resume <id>` or `-- -c` reopen a session.
-- `--no-persist` uses a throwaway folder deleted on exit. The TUI profile is then installed with
-  pnpm again on every start (about 9 s and 89 MB in testing).
+  `/settings`, the TUI's preferences and the installed profile survive between runs.
+  `-- --resume <id>` reopens any session in the shared store; `-- -c` continues only the last
+  session started from this session folder.
+- `--no-persist` uses a throwaway folder deleted on exit; your sessions still land in your store.
+  The TUI profile is then installed with pnpm again on every start (about 9 s and 89 MB in
+  testing).
 - The model stays on the agent-switch route, whatever the TUI's model picker saved: each run of
   agent-switch drops the saved `/model` pick. A `--no-launch` recipe you reuse later keeps a pick
   made in between; run agent-switch again to drop it.
@@ -165,20 +183,13 @@ your PATH.
 
 With `--url` or `--provider`, omp runs on a session agent dir:
 
-- `PI_CODING_AGENT_DIR` points at `<session>/agent`. `PI_PROFILE` and
-  `PI_CODING_AGENT_SESSION_DIR` are cleared, so omp keeps its sessions in the session agent dir,
-  one folder per project. `HOME` stays yours.
+- `PI_CODING_AGENT_DIR` points at `<session>/agent`. `PI_PROFILE` is cleared. `HOME` stays yours.
 - omp and Bun fill only unset or empty variables from `.env` files: `.env` in the project, the
   session agent dir, `~/.omp` and `~`, plus the project's `.env.local`, `.env.<NODE_ENV>` and
   `.env.<NODE_ENV>.local` that Bun loads before omp starts (`development` when `NODE_ENV` is
   unset). So agent-switch sets what such a line must not change:
   - `PI_CONFIG_DIR` to the root agent-switch reads (yours, else `.omp`) and `OMP_PROFILE` to
     `default`.
-  - When one of these files sets `PI_CODING_AGENT_SESSION_DIR` (or, in omp's own files,
-    `OMP_CODING_AGENT_SESSION_DIR`), `PI_CODING_AGENT_SESSION_DIR` to a folder of the project's
-    own, `<session>/agent/sessions-pinned/<hash of the project dir>`, so the sessions stay in the
-    session and projects stay apart. The project dir is the one omp runs in, so a `--cwd` after
-    `--` counts.
   - When one of them sets `OMP_PROFILE` or `PI_PROFILE` to a named profile, the launch stops
     with the file's name: a profile ignores `PI_CODING_AGENT_DIR`.
   - When one of them, other than the session agent dir's own, sets `PI_CODING_AGENT_DIR` or
@@ -186,10 +197,16 @@ With `--url` or `--provider`, omp runs on a session agent dir:
     shell does not, the launch stops too: your own omp follows it, but agent-switch reads your
     settings and resources only from the shell's value. A non-empty shell value wins over the
     file, for omp too, so then the line is ignored.
-  In both cases, export the variable in your shell instead of the `.env` file: agent-switch
-  follows a shell value (a profile with `--url`/`--provider`). These checks read one
-  `KEY=VALUE` per line, so a value continued on the next line, which Bun's parser accepts, is not
-  seen. All of them run before agent-switch connects to the model server.
+  - On Linux and macOS, when your shell does not set `XDG_DATA_HOME` or `XDG_STATE_HOME`, the
+    value your own omp ends up with from these files (the first non-empty one in the order it
+    reads them, your omp agent dir's `.env` included) names a folder whose `omp` subfolder
+    exists, and you use the default agent dir, the launch stops too: your own omp then keeps its
+    sessions there, but agent-switch follows those variables only from the shell.
+  In all these cases, export the variable in your shell instead of the `.env` file: agent-switch
+  follows a shell value (a profile with `--url`/`--provider`). These checks read the files as
+  omp's own parser does: quotes, `#` comments, and no `$VAR` expansion. For the XDG and session
+  dir values, `$VAR` and `${VAR}` in the project files Bun loads are filled in from your
+  environment, as Bun does. All of them run before agent-switch connects to the model server.
 - omp starts with `--model agent-switch/<id>`. The session `models.yml` holds the `agent-switch`
   provider with one row per served model; the session `config.yml` turns off omp's onboarding
   (`startup.setupWizard: false`) and starts at `defaultThinkingLevel: xhigh` where agent-switch
@@ -205,8 +222,40 @@ With `--url` or `--provider`, omp runs on a session agent dir:
   `secrets.enabled` is on (in your settings or the session's), agent-switch stops before
   connecting unless the session's `secrets.yml` is a link to yours or a whole copy it made this
   run: omp reads the secret rules only from its agent dir.
+- Your session history is shared, so `--resume` and `--continue` see the sessions of native omp,
+  and native omp sees the ones made here:
+  - `sessions`, `blobs` and `archive` in the session agent dir link to those in your omp agent
+    dir, `terminal-sessions` and `custom-session-files` too. On Linux and macOS, with the default
+    agent dir, the first three link to `$XDG_DATA_HOME/omp` and the other two to
+    `$XDG_STATE_HOME/omp` when that folder exists, as omp does (`.../omp/profiles/<name>` for a
+    profile).
+  - A folder missing on your side is created there first, so a first run writes into your
+    history too.
+  - These are always links (a symlink, or a junction on Windows), never copies. When none can be
+    made, the launch stops.
+  - A real folder of the same name with content, such as the sessions of an earlier `--persist`
+    session, is moved to `<name>.agent-switch-old` (`-1`, `-2` and so on when that exists), with
+    a note on stderr. An empty one is removed.
+  - `PI_CODING_AGENT_SESSION_DIR` follows your own omp. A shell value, and one from a `.env`
+    file the session's omp reads too (the project's, `~/.omp/.env` and `~/.env`), reach it as
+    they are. When your own omp would take the value from a file only it reads, your omp agent
+    dir's `.env` or a named profile's `~/.omp/profiles/<name>/.env` (`OMP_CODING_AGENT_SESSION_DIR`
+    counts there too), agent-switch exports that value, so the session writes where your omp
+    does.
+  - With a named profile, the session's omp also reads `~/.omp/.env`, which your profile does
+    not. When that file sets a session dir, agent-switch exports your profile's own value, and
+    stops when your profile has none: left unset, omp keeps one folder per project, which no
+    value can say.
+  - `history.db` (your prompt history and omp's session index) stays the session's own.
+  - When you have a `secret-placeholder.key` (in `$XDG_STATE_HOME/omp` or your omp agent dir),
+    the session's links to it, so hidden secrets keep the same placeholders. Without one, nothing
+    is created on your side and omp makes one in the session when secrets are on. A key that
+    cannot be linked, for example across disks on Windows, is copied (0600) instead, as it never
+    changes; when that fails too, agent-switch warns and goes on.
+  - `/resume` inside the session switches to the session's original model when that model's API
+    key is at hand. Native omp opening a session made here warns and falls back to another model.
 - Not inherited from your omp agent dir: `config.yml`, `models.yml`, `mcp.json`, the legacy
-  `settings.json`, `.env`, your login (`agent.db`) and your sessions.
+  `settings.json`, `.env` and your login (`agent.db`).
 - Your safety settings do come along, because without them omp approves every tool call:
   `tools.approvalMode`, `tools.approval`, `tools.restrictedFolders`, `mcp.enableProjectConfig`,
   `disabledProviders`, `bash.patterns`, `bash.gitGuard` and `secrets.enabled` are copied from
@@ -319,13 +368,69 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 
 ### Session history
 
-- `--persist` keeps the agent's agent-switch session folder, so the agent's own resume can reopen
-  the session, for example `agent-switch codex --persist -- resume`.
-- Without it, codex, pi and dsh run with their whole home moved into a session folder that is
-  deleted on exit. omp keeps `HOME`, but its agent dir, and with it its sessions, lives in that
-  folder too.
-- claude and opencode keep sessions in your own stores (`~/.claude`, `~/.local/share/opencode`), so
-  they can always resume.
+claude, opencode, omp, pi, dsh and dsh-tui read and write your own session history in each mode:
+native, native with `--skill` or MCP flags, `--url`, and `--url --persist`. A session you start
+natively can be resumed through agent-switch, and the other way round. The exceptions: a Windows
+pi or dsh run from WSL keeps its own history, and dsh and dsh-tui don't follow a session store
+your own dsh patch layers move or re-encode (see [DeepSeek Harness](#deepseek-harness)).
+
+| Agent | Your history | How a session reaches it |
+|---|---|---|
+| claude | `~/.claude/projects` | agent-switch changes only the config |
+| opencode | `~/.local/share/opencode` | agent-switch changes only the config |
+| omp | your omp agent dir, or `$XDG_DATA_HOME/omp` and `$XDG_STATE_HOME/omp` | links, see [OMP](#omp-oh-my-pi) |
+| pi | `sessions` in your pi agent dir | a link, see below |
+| dsh | `sessions` and `attachments` in your DSH home | patch rows, see [DeepSeek Harness](#deepseek-harness) |
+| dsh-tui, dst | the same store, or your `DSH_TUI_SESSION_ROOT` | `DSH_TUI_SESSION_ROOT`, see [DeepSeek Harness](#deepseek-harness) |
+
+- `--persist` keeps the agent-switch session folder between runs: settings and other state changed
+  inside the session, and dsh-tui's installed profile. The agents above resume without it.
+- codex still runs with its whole home moved into a session folder that is deleted on exit, so it
+  needs `--persist` to resume, for example `agent-switch codex --persist -- resume`.
+- pi with `--url` or `--provider` moves `HOME` and `PI_CODING_AGENT_DIR` into its session folder,
+  but shares your history, so `--resume` and `--continue` see your native pi sessions and native
+  pi sees the ones made there:
+  - `<session>/.pi/agent/sessions` links to `sessions` in your pi agent dir (`~/.pi/agent`, or
+    your `PI_CODING_AGENT_DIR`). A folder missing on your side is created there first. These are
+    always links (a symlink, or a junction on Windows), never copies; when none can be made, the
+    launch stops.
+  - A real `sessions` folder with content in the session, such as an earlier `--persist`
+    session's, is moved to `sessions.agent-switch-old` (`-1`, `-2` and so on when that exists),
+    with a note on stderr. An empty one is removed.
+  - A `PI_CODING_AGENT_SESSION_DIR` in your shell reaches pi, with a leading `~` expanded against
+    your own home, since pi would expand it against the moved `HOME`. The `sessionDir` in your
+    own `settings.json` is copied into the session's the same way; a value set inside the
+    session wins, and the copy goes when you remove yours. A project's `.pi/settings.json`
+    `sessionDir` applies as it does natively; when you don't set `PI_CODING_AGENT_SESSION_DIR`
+    and it starts with `~`, agent-switch expands it against your own home and passes it as
+    `PI_CODING_AGENT_SESSION_DIR`, which pi reads before its settings. A `--no-launch` recipe
+    leaves that value out, since it may run in another project, and a note on stderr asks you to
+    export it in your shell or make the `sessionDir` absolute. A `--session-dir` after `--` still
+    wins over both.
+  - With native `--skill`, the overlay's `sessions` links to yours too. A later `--no-launch`
+    without `--skill` moves real sessions found in the overlay aside before removing it.
+  - A Windows pi run from WSL can't follow the links, so its session keeps its own history,
+    with a note, and a `PI_CODING_AGENT_SESSION_DIR` in your shell, meant for a Linux pi, is
+    cleared for it. Native Windows pi keeps its history in `%USERPROFILE%\.pi`.
+- agent-switch does not move older omp sessions into your store. Those of a `--persist` or
+  `--no-launch` session are in `~/.agent-switch/agents/omp/agent/sessions` (moved to
+  `sessions.agent-switch-old` on the next run), in
+  `~/.agent-switch/agents/omp/agent/sessions-pinned/`, and for `--skill` or MCP flags with
+  `--no-launch` in `~/.agent-switch/agents/omp-native/agent/sessions` (or
+  `sessions.agent-switch-old`). Open one with `omp --resume <path>`. Their images and large
+  outputs stay in the `blobs.agent-switch-old` folder beside them, and omp reads blobs from the
+  linked `blobs`, so an old session opened later lacks them unless you move them back into your
+  `blobs`. Those of a run without `--persist` were deleted on exit.
+- agent-switch does not move older pi sessions into your store either. Those of a `--persist` or
+  `--no-launch` session are in `~/.agent-switch/agents/pi/.pi/agent/sessions` (moved to
+  `sessions.agent-switch-old` on the next run), and for `--skill` with `--no-launch` in
+  `~/.agent-switch/agents/pi-native/agent/sessions` (or `sessions.agent-switch-old`). Open one
+  with `pi --session <path>`. Those of a run without `--persist` were deleted on exit.
+- Older dsh and dsh-tui sessions stay where they were too: `~/.agent-switch/agents/dsh/sessions`
+  for dsh with `--persist` or `--no-launch`, and `~/.agent-switch/agents/dsh-tui/.dsh/sessions`
+  for dsh-tui. To browse the dsh-tui ones, start it once with `DSH_TUI_SESSION_ROOT` set to that
+  folder. Those of a run without `--persist` (dsh) or with `--no-persist` (dsh-tui) were deleted
+  on exit.
 
 ### Plan files
 
@@ -473,14 +578,19 @@ few setups cannot use it:
   would switch the profile off. An empty or `default` value is fine and is cleared.
 - On Linux and macOS, an existing `$XDG_DATA_HOME/omp`, `$XDG_STATE_HOME/omp` or
   `$XDG_CACHE_HOME/omp` while you use the default agent dir: omp keeps your login and sessions
-  there, and the overlay would hide them. An `XDG_*_HOME` set only in a `.env` file is not seen by
-  this check.
+  there, and the overlay would hide them. An `XDG_DATA_HOME` or `XDG_STATE_HOME` set in a `.env`
+  file stops the launch as in `--url` mode; an `XDG_CACHE_HOME` there is not seen by this check.
 - A `--profile` after `--`.
 
 For those, use `--url`/`--provider`, or add the skill or MCP server to your own omp config. As in
 `--url` mode, the overlay sets `PI_CONFIG_DIR` and `OMP_PROFILE=default`, and stops when a `.env`
 file selects a named profile, an agent dir or a config root (see [OMP](#omp-oh-my-pi)). Your
-`PI_CODING_AGENT_SESSION_DIR` stays as it is.
+`PI_CODING_AGENT_SESSION_DIR` stays as it is. The overlay's `sessions`, `blobs`, `archive`,
+`terminal-sessions` and `custom-session-files` link to those in your agent dir, as in `--url`
+mode, so history omp wrote into a `--no-launch` overlay is moved aside, never removed. A later
+`--no-launch` without those flags first moves real history at those names aside too, then
+removes everything else in the overlay (links, a login, a merged `mcp.json`), and keeps the
+folder only while history moved aside is in it.
 
 ## Agent aliases
 

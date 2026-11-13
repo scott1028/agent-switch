@@ -4,7 +4,6 @@
 """`agent-switch omp`: OMP (oh-my-pi) native launch, its session overlay and aliases."""
 
 import contextlib
-import hashlib
 import os
 import re
 import shlex
@@ -76,7 +75,7 @@ from agent_switch.core.options import (
     _yolo_command_flags,
     opencode_output_limit,
 )
-from agent_switch.core.overlay import write_native_overlay
+from agent_switch.core.overlay import link_user_store, remove_native_overlay, write_native_overlay
 from agent_switch.core.platform import (
     _create_directory_junction,
     _is_junction,
@@ -117,6 +116,16 @@ _OMP_USER_RESOURCES = (
 )
 
 
+# The user's own session history, which every session links instead of keeping its own: the
+# sessions, their blobs and archive go under omp's data dir, the terminal breadcrumbs and custom
+# session file records under its state dir (packages/utils/src/dirs.ts:1003-1056; the archive
+# sits beside sessions, packages/coding-agent/src/cli/gc-cli.ts:381-383). history.db, the prompt
+# history and a session index omp backfills from the session files, stays the session's own: it is
+# SQLite in WAL mode (src/session/history-storage.ts:134, src/session/session-index.ts:1-12,101).
+_OMP_USER_DATA = ("sessions", "blobs", "archive")
+_OMP_USER_STATE = ("terminal-sessions", "custom-session-files")
+
+
 # The user's own safety settings a --url session keeps: without them omp approves every tool
 # call (src/tools/settings.ts:314-318), loads project MCP config (docs/mcp-config.md), drops
 # its bash rules and git guard (src/exec/settings.ts:144-161) and stops redacting secrets
@@ -131,8 +140,21 @@ _OMP_USER_SAFETY_SETTINGS = (
 _UNSET = object()
 
 
-# One KEY=VALUE line of a .env file, with an optional `export`.
-_DOTENV_LINE = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
+# One entry of a .env file as Bun's node:util parseEnv reads it, which omp's own loader uses
+# (packages/utils/src/env.ts:4,267-276): an optional `export`; a value in ", ' or ` quotes, which
+# may span lines and ends at the first closing quote followed by nothing but a # comment; else
+# the rest of the line up to a #. No $ expansion. (Checked against Bun 1.3.14; only some
+# malformed quoting, such as a backslash or a doubled quote before the closing one, differs.)
+_DOTENV_ENTRY = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z0-9_.-]+)[ \t]*=[ \t]*"
+    r"(?:([\"'`])([\s\S]*?)\2[ \t]*(?:#.*)?$|([^#\n]*))",
+    re.M,
+)
+
+
+# A $VAR or ${VAR} reference, as omp reads Bun's expansion of the project's .env files
+# (packages/utils/src/env.ts:138-152); a backslash before the $ keeps it literal.
+_DOTENV_VARIABLE = re.compile(r"(\\)?\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
 
 # The full effort ladder, as Pi's thinkingLevelMap offers xhigh and max: omp's own default for a
@@ -265,6 +287,85 @@ def _get_omp_user_agent_dir(agent_dir: Path) -> Path:
         # Do not treat this session as its own resource source.
         source = root / "agent"
     return source
+
+
+def _get_omp_user_config_root() -> Path:
+    """The user's own omp config root: ~/.omp, or a named profile's (dirs.ts:116-123)."""
+    profile = _get_omp_profile()
+    root = _get_omp_config_root()
+    return root / "profiles" / profile if profile else root
+
+
+def _get_omp_xdg_dir(source: Path, xdg_home: Optional[str]) -> Optional[Path]:
+    """The dir under xdg_home (an $XDG_*_HOME value) that omp on agent dir source uses instead."""
+    # Only the default agent dir moves there, on Linux and macOS, and only once that dir exists;
+    # a named profile needs its own dir there (packages/utils/src/dirs.ts:368,385-401,427-431).
+    if sys.platform not in ("linux", "darwin") or not xdg_home:
+        return None
+    if source != _get_omp_user_config_root() / "agent":
+        return None
+    xdg_dir = Path(os.path.abspath(os.path.join(xdg_home, "omp")))
+    profile = _get_omp_profile()
+    if profile:
+        xdg_dir = xdg_dir / "profiles" / profile
+    return xdg_dir if xdg_dir.exists() else None
+
+
+def _get_omp_user_store(source: Path, category: Literal["data", "state"]) -> Path:
+    """Where the user's own omp keeps its data or state files for the agent dir source."""
+    return _get_omp_xdg_dir(source, os.environ.get(f"XDG_{category.upper()}_HOME")) or source
+
+
+def write_omp_user_sessions(agent_dir: Path, source: Path) -> None:
+    """Link the user's own omp session history into the session agent dir, so the session and
+    native omp resume each other's sessions, and the user's secret placeholder key, so they
+    show the same placeholders."""
+    for category, names in (("data", _OMP_USER_DATA), ("state", _OMP_USER_STATE)):
+        store = _get_omp_user_store(source, category)
+        for name in names:
+            if not link_user_store(store / name, agent_dir / name):
+                _fail(
+                    f"Couldn't link your omp {store / name} into the session ({agent_dir / name}), "
+                    "and agent-switch never copies session history; fix that and re-run."
+                )
+    # omp keeps the key in its state dir, or still in the agent dir until it moves it there
+    # (packages/utils/src/dirs.ts:1075-1115), and reads it only with secrets on, which a project
+    # can turn on too (src/config/settings.ts:1404-1405). Only a key the user has is linked: an
+    # empty or dangling one stops omp from making its own (src/secrets/index.ts:23-52).
+    key = agent_dir / "secret-placeholder.key"
+    user_keys = [
+        path for path in (_get_omp_user_store(source, "state") / key.name, source / key.name)
+        if path.is_file()
+    ]
+    if user_keys:
+        _write_omp_secret_key(user_keys[0], key)
+    elif key.is_symlink() and not key.exists():
+        key.unlink()
+
+
+def _write_omp_secret_key(user_key: Path, target: Path) -> None:
+    """Link the user's placeholder key at target, else copy it in, as it never changes; without
+    either, warn and go on: the session then hides secrets with a key of its own."""
+    with contextlib.suppress(OSError):
+        if target.read_bytes() == user_key.read_bytes():
+            # A link, or the copy an earlier run made.
+            return
+    if link_user_store(user_key, target, is_file = True):
+        return
+    # Copy beside the target, then rename it in, so a copy that fails part way leaves nothing.
+    temp = target.with_name(f".{target.name}.agent-switch-copy")
+    try:
+        _write_private_text(temp, user_key.read_text(encoding = "utf-8"))
+        os.replace(temp, target)
+    except (OSError, UnicodeDecodeError):
+        with contextlib.suppress(OSError):
+            temp.unlink(missing_ok = True)
+        typer.echo(
+            f"Warning: couldn't link or copy your {user_key} into the omp session ({target}); "
+            "with secrets on, the session hides them with a key of its own, which your own omp "
+            "can't read back.",
+            err = True,
+        )
 
 
 def _refuse_omp_profile(args: list) -> None:
@@ -620,23 +721,24 @@ def write_omp_config(
 
 
 def _read_dotenv(path: Path) -> dict:
-    """A .env file's KEY=VALUE pairs, enough to tell which keys it sets non-empty."""
+    """A .env file's KEY=VALUE pairs, as omp's own loader reads them."""
     try:
-        lines = path.read_text(encoding = "utf-8").splitlines()
+        # Read in text mode, so a CRLF line ends as LF, as parseEnv takes it.
+        text = path.read_text(encoding = "utf-8")
     except (OSError, UnicodeDecodeError):
         return {}
     values = {}
-    for line in lines:
-        match = _DOTENV_LINE.fullmatch(line)
-        if match is None:
-            continue
-        value = match.group(2).strip()
-        if value[:1] in ("'", '"'):
-            end = value.find(value[0], 1)
-            value = value[1:end] if end != -1 else value[1:]
+    for match in _DOTENV_ENTRY.finditer(text):
+        key, quote, quoted, plain = match.groups()
+        if quote is None:
+            values[key] = plain.strip()
+        elif quote == '"':
+            # Only double quotes turn \n and \r into line breaks.
+            values[key] = re.sub(
+                r"(?<!\\)\\([nr])", lambda escape: "\n" if escape[1] == "n" else "\r", quoted,
+            )
         else:
-            value = "" if value.startswith("#") else value.split(" #", 1)[0].strip()
-        values[match.group(1)] = value
+            values[key] = quoted
     return values
 
 
@@ -654,16 +756,68 @@ def _get_omp_dotenv_files(agent_dir: Path) -> list:
     return [(path, True) for path in omp_files] + [(path, False) for path in bun_files]
 
 
-def _get_has_dotenv_session_dir(agent_dir: Path) -> bool:
-    """Whether a .env file omp or Bun loads into omp's env sets its session dir."""
-    for path, is_omp_file in _get_omp_dotenv_files(agent_dir):
+def _get_omp_user_dotenv_files(source: Path) -> list:
+    """(path, whether omp itself loads it, whether only the user's own omp does) for each .env
+    file the user's own omp on agent dir source reads, the winning one first."""
+    files = _get_omp_dotenv_files(source)
+    root = _get_omp_user_config_root()
+    # Bun loads its files first, a later one winning (utils/src/env.ts:162-167); omp then fills
+    # an unset name from the project, agent dir, config root and home files in that order, the
+    # config root a named profile's own (env.ts:288-293,384-392). The session's omp has its own
+    # agent dir and the default profile, so it never reads the user's agent dir or profile file.
+    return [
+        *((path, False, False) for path, is_omp_file in reversed(files) if not is_omp_file),
+        (Path.cwd() / ".env", True, False),
+        (source / ".env", True, True),
+        (root / ".env", True, root != _get_omp_config_root()),
+        (Path.home() / ".env", True, False),
+    ]
+
+
+def _get_omp_user_dotenv_value(source: Path, name: str) -> tuple:
+    """(value, path, whether only the user's own omp reads that file) for the value of name the
+    user's own omp on agent dir source takes from its .env files; (None, None, False) for none."""
+    for path, is_omp_file, is_user_only in _get_omp_user_dotenv_files(source):
         values = _read_dotenv(path)
-        # Only omp's own files map OMP_ names onto PI_ ones (utils/src/env.ts:279-284).
-        if values.get("PI_CODING_AGENT_SESSION_DIR") or (
-            is_omp_file and values.get("OMP_CODING_AGENT_SESSION_DIR")
-        ):
-            return True
-    return False
+        value = values.get(name)
+        if is_omp_file and name.startswith("PI_"):
+            # In omp's own files an OMP_ name replaces its PI_ one (utils/src/env.ts:279-284).
+            value = values.get("OMP_" + name[len("PI_"):], value)
+        if value and path.parent == Path.cwd():
+            # Bun loads the project's files itself and expands $VAR and ${VAR} in them from the
+            # env (utils/src/env.ts:112-114,138-152).
+            value = _DOTENV_VARIABLE.sub(
+                lambda ref: ref[0][1:] if ref[1] else os.environ.get(ref[2] or ref[3], ""), value,
+            )
+        if value:
+            return value, path, is_user_only
+    return None, None, False
+
+
+def _get_omp_user_session_dir(source: Path) -> Optional[str]:
+    """The session dir to export so the session's omp writes where the user's own omp on agent
+    dir source does; None when the session's omp gets the same value by itself."""
+    name = "PI_CODING_AGENT_SESSION_DIR"
+    if os.environ.get(name):
+        # A non-empty launcher value wins over every dotenv file (utils/src/env.ts:204-206,387).
+        return None
+    value, _, is_user_only = _get_omp_user_dotenv_value(source, name)
+    profile = _get_omp_profile()
+    default_dotenv = _get_omp_config_root() / ".env"
+    session_values = _read_dotenv(default_dotenv) if profile else {}
+    if session_values.get("OMP_CODING_AGENT_SESSION_DIR", session_values.get(name)):
+        # The session's omp runs on the default profile, so it reads ~/.omp/.env, which a named
+        # profile does not (utils/src/env.ts:291): only an export keeps the session off its value.
+        if value:
+            return value
+        # Unset, omp keeps one sessions folder per project, which no value can say.
+        _fail(
+            f"{default_dotenv} sets a session dir that this session's omp reads, as it runs on "
+            f"the default profile, but your omp profile {profile!r} does not read that file, so "
+            "the session would keep its history apart from yours. Set the session dir in "
+            f"{_get_omp_user_config_root() / '.env'} or your shell too, or remove that line."
+        )
+    return value if is_user_only else None
 
 
 def _refuse_omp_dotenv_overrides(agent_dir: Path, *, is_session_agent_dir: bool) -> None:
@@ -702,22 +856,21 @@ def _refuse_omp_dotenv_overrides(agent_dir: Path, *, is_session_agent_dir: bool)
                         f"read the wrong ones. Export {name} in your shell instead, which "
                         "agent-switch follows, or remove that line."
                     )
-
-
-def _get_omp_run_cwd(args: list) -> Path:
-    """The dir omp runs in: the last --cwd before a passthrough --, from the launch dir."""
-    # src/cli/flag-tables.ts:134-135, cli/args.ts:281-289 (--cwd=), cli/startup-cwd.ts:48-68.
-    value = None
-    index = 0
-    while index < len(args) and args[index] != "--":
-        if args[index] == "--cwd" and index + 1 < len(args):
-            value = args[index + 1]
-            index += 1
-        elif args[index].startswith("--cwd="):
-            value = args[index][len("--cwd="):]
-        index += 1
-    # Physical, like Path.cwd(), so two spellings of one dir share a folder.
-    return Path(os.path.realpath(os.path.join(os.getcwd(), value))) if value else Path.cwd()
+    source = _get_omp_user_agent_dir(agent_dir) if is_session_agent_dir else agent_dir
+    for name in ("XDG_DATA_HOME", "XDG_STATE_HOME"):
+        if os.environ.get(name):
+            # A non-empty launcher value wins over every dotenv file (utils/src/env.ts:204-206).
+            continue
+        # omp redoes its dirs with the value it ends up with (utils/src/env.ts:394-400).
+        value, path, _ = _get_omp_user_dotenv_value(source, name)
+        xdg_dir = _get_omp_xdg_dir(source, value)
+        if xdg_dir:
+            _fail(
+                f"{path} sets {name}: your own omp then keeps its sessions in {xdg_dir}, but "
+                f"agent-switch reads {name} only from the shell, so it would link the wrong ones. "
+                f"Export {name} in your shell instead, which agent-switch follows, or remove that "
+                "line."
+            )
 
 
 def _get_omp_session_env(agent_dir: Path) -> dict:
@@ -765,8 +918,9 @@ def _link_omp_user_entry(source: Path, target: Path) -> bool:
 def write_omp_user_resources(
     agent_dir: Path, source: Path, *, skills: Optional[dict] = None,
 ) -> list:
-    """Expose the user's own omp resources in the session; config, auth and state stay out.
-    The names copied whole instead of linked come back."""
+    """Expose the user's own omp resources in the session; config, auth and other state stay
+    out, and write_omp_user_sessions shares the session history. The names copied whole
+    instead of linked come back."""
     agent_dir.mkdir(parents = True, exist_ok = True, mode = 0o700)
     skills_root = agent_dir / "skills"
     if skills is not None:
@@ -939,6 +1093,8 @@ def omp(
                 source,
                 excluded = ("mcp.json",) if mcp_servers else (),
                 skills = skills,
+                # The XDG refusal above keeps these in the user's agent dir.
+                shared = (*_OMP_USER_DATA, *_OMP_USER_STATE),
             )
             if mcp_servers:
                 _write_omp_native_mcp_config(
@@ -949,7 +1105,7 @@ def omp(
             # PI_CODING_AGENT_SESSION_DIR stays the user's, as in Pi's native overlay.
             unset_env = ("PI_PROFILE",)
         else:
-            _remove_overlay_entry(agent_dir)
+            remove_native_overlay(agent_dir, shared = (*_OMP_USER_DATA, *_OMP_USER_STATE))
         _run_native(
             alias or "omp",
             env,
@@ -1005,6 +1161,8 @@ def _run_omp_session(
                 f"({secrets_path}), so secrets.enabled would run without all of your secret "
                 "rules; fix that and re-run."
             )
+        write_omp_user_sessions(agent_dir, source)
+        session_dir = _get_omp_user_session_dir(source)
         base, key, entry = _connect(model, load, server_options = server_options, target = target)
         served_models = _get_served_models(target, key, entry["id"])
         # omp sets the thinking level itself where the server carries it, as Pi does; auto
@@ -1032,16 +1190,12 @@ def _run_omp_session(
         sent_flags = ["--model", f"{_OMP_PROVIDER}/{entry['id']}", *thinking_flags, *yolo_flags]
         command = ["omp", *sent_flags, *_drop_overridden_args("omp", ctx.args, sent_flags)]
         env = _get_omp_session_env(agent_dir)
-        # omp picks PI_CODING_AGENT_SESSION_DIR over <agentDir>/sessions (src/cli/args.ts:260).
-        # Unset, omp keeps one sessions folder per project; a named dir holds them all
-        # together (session/session-paths.ts:296-310), and a --persist session serves every
-        # project. Only when a .env file would fill the unset variable (utils/src/env.ts:384-392)
-        # is it pinned, to a folder of the project omp runs in.
-        unset_env = ("PI_PROFILE", "PI_CODING_AGENT_SESSION_DIR")
-        if _get_has_dotenv_session_dir(agent_dir):
-            project = hashlib.sha256(str(_get_omp_run_cwd(ctx.args)).encode()).hexdigest()[:16]
-            env["PI_CODING_AGENT_SESSION_DIR"] = str(agent_dir / "sessions-pinned" / project)
-            unset_env = ("PI_PROFILE",)
+        # omp picks PI_CODING_AGENT_SESSION_DIR over <agentDir>/sessions (src/cli/args.ts:260),
+        # which links to the user's own. The shell's value and the .env files both omps read
+        # reach it as they reach the user's omp; a value only the user's omp reads goes along.
+        if session_dir:
+            env["PI_CODING_AGENT_SESSION_DIR"] = session_dir
+        unset_env = ("PI_PROFILE",)
         # Wrappers from an earlier run go; this run writes its own.
         _remove_overlay_entry(session / "mcp")
         write_omp_models(

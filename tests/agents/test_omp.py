@@ -3,7 +3,6 @@
 
 """`agent-switch omp`: native launch, the session overlay, `omp-<x>` aliases and --url."""
 
-import hashlib
 import json
 import os
 import shlex
@@ -161,10 +160,46 @@ def test_native_omp_skill_overlay_keeps_the_user_config(fake_vllm, tmp_path, mon
         assert (overlay / name).resolve() == user_agent / name
     assert (overlay / "skills" / "user-only").resolve() == user_agent / "skills" / "user-only"
     assert (overlay / "skills" / "injected").resolve() == source
+    # omp writes its sessions into the user's own history, even before the user has any.
+    assert (overlay / "sessions").is_symlink()
+    assert (overlay / "sessions").resolve() == user_agent / "sessions"
     cleared = CliRunner().invoke(start.start_app, ["omp", "--no-launch"])
     assert cleared.exit_code == 0, cleared.output
     assert _launch_command(cleared.output) == ["omp"]
     assert not os.path.lexists(overlay)
+    assert (user_agent / "sessions").is_dir()
+
+
+def test_native_omp_keeps_history_moved_aside_when_the_overlay_goes(fake_vllm, tmp_path, omp_user):
+    user_agent, source = omp_user
+    overlay = tmp_path / "agents" / "omp-native" / "agent"
+    # Sessions omp wrote into a fixed overlay before it linked yours.
+    (overlay / "sessions").mkdir(parents = True)
+    (overlay / "sessions" / "old.jsonl").write_text("old\n")
+    assert CliRunner().invoke(start.start_app, ["omp", "--no-launch", "--skill", str(source)]).exit_code == 0
+    # What omp wrote into the overlay itself: a login, its prompt history, a merged mcp.json.
+    (overlay / "agent.db").write_text("login\n")
+    (overlay / "history.db").write_text("prompts\n")
+    (overlay / "mcp.json").unlink()
+    (overlay / "mcp.json").write_text('{"mcpServers": {"x": {"headers": {"Authorization": "t"}}}}')
+    cleared = CliRunner().invoke(start.start_app, ["omp", "--no-launch"])
+    assert cleared.exit_code == 0, cleared.output
+    assert (overlay / "sessions.agent-switch-old" / "old.jsonl").read_text() == "old\n"
+    # Everything else goes, as it did before history was moved aside.
+    assert os.listdir(overlay) == ["sessions.agent-switch-old"]
+    assert (user_agent / "sessions").is_dir() and (user_agent / "config.yml").is_file()
+
+
+def test_native_omp_moves_real_sessions_aside_when_the_overlay_goes(fake_vllm, tmp_path, omp_user):
+    overlay = tmp_path / "agents" / "omp-native" / "agent"
+    # An overlay from before omp linked your sessions, cleared by a plain run first.
+    (overlay / "sessions" / "project").mkdir(parents = True)
+    (overlay / "sessions" / "project" / "s.jsonl").write_text("old\n")
+    (overlay / "blobs").mkdir()
+    cleared = CliRunner().invoke(start.start_app, ["omp", "--no-launch"])
+    assert cleared.exit_code == 0, cleared.output
+    assert (overlay / "sessions.agent-switch-old" / "project" / "s.jsonl").read_text() == "old\n"
+    assert os.listdir(overlay) == ["sessions.agent-switch-old"]
 
 
 def test_native_omp_mcp_adds_mounted_servers_to_the_user_ones(fake_vllm, tmp_path, omp_user):
@@ -478,8 +513,8 @@ def test_connect_omp_no_launch(fake_vllm, tmp_path, monkeypatch, omp_url_user):
     _assert_env_unset(result.output, "PI_PROFILE")
     _assert_env_set(result.output, "OMP_PROFILE", "default")
     _assert_env_set(result.output, "PI_CONFIG_DIR", ".omp")
-    # Unset keeps omp's per-project session folders inside the session agent dir.
-    _assert_env_unset(result.output, "PI_CODING_AGENT_SESSION_DIR")
+    # The shell's session dir reaches omp as it is, as it reaches the user's own omp.
+    assert "PI_CODING_AGENT_SESSION_DIR" not in result.output
     # The key reaches omp through the env, so omp never reads it as a command or a name.
     _assert_env_set(result.output, "AGENT_SWITCH_OMP_API_KEY", KEY)
     # omp reads Claude, Codex and ~/.agents resources through HOME, so it stays.
@@ -502,66 +537,211 @@ def test_connect_omp_no_launch(fake_vllm, tmp_path, monkeypatch, omp_url_user):
     for name in ("skills", "commands", "rules", "extensions", "agents", "AGENTS.md", "SYSTEM.md", "secrets.yml", "ssh.json"):
         assert (agent_dir / name).is_symlink(), name
         assert (agent_dir / name).resolve() == user_agent / name
-    for name in ("agent.db", "settings.json", "sessions", ".env"):
+    for name in ("agent.db", "settings.json", ".env"):
         assert not os.path.lexists(agent_dir / name), name
+    # Session history is the user's own, so native omp and this session resume each other's.
+    stores = ("sessions", "blobs", "archive", "terminal-sessions", "custom-session-files")
+    for name in stores:
+        assert (agent_dir / name).is_symlink(), name
+        assert (agent_dir / name).resolve() == user_agent / name
     # The session writes its own config.yml and mcp.json; the user's are not linked.
     assert not (agent_dir / "mcp.json").is_symlink()
     assert not (agent_dir / "config.yml").is_symlink()
     assert "theme" not in yaml.safe_load((agent_dir / "config.yml").read_text())
-    assert sorted(str(path) for path in user_agent.rglob("*")) == before
+    # Only the missing stores are created; nothing of the user's changes.
+    created = [str(user_agent / name) for name in stores if name != "sessions"]
+    assert sorted(str(path) for path in user_agent.rglob("*")) == sorted([*before, *created])
 
 
-@pytest.mark.parametrize(("where", "line"), [
-    ("home", "PI_CODING_AGENT_SESSION_DIR=/elsewhere"),
-    ("config-root", 'export OMP_CODING_AGENT_SESSION_DIR="/elsewhere"'),
-    ("project", "PI_CODING_AGENT_SESSION_DIR='/elsewhere' # mine"),
-    ("session-agent", "PI_CODING_AGENT_SESSION_DIR=/elsewhere"),
-    # Bun loads these project files itself before omp starts (utils/src/env.ts:112-114,162-167).
-    ("project/.env.local", "PI_CODING_AGENT_SESSION_DIR=/elsewhere"),
-    ("project/.env.development", "PI_CODING_AGENT_SESSION_DIR=/elsewhere"),
-])
-def test_omp_url_pins_the_session_dir_a_dotenv_would_move(fake_vllm, tmp_path, monkeypatch, omp_url_user, where, line):
-    user_agent, _ = omp_url_user
+def _write_omp_dotenv(tmp_path, monkeypatch, user_agent, where: str, line: str) -> None:
     project = tmp_path / "project"
-    project.mkdir()
+    project.mkdir(exist_ok = True)
     monkeypatch.chdir(project)
-    agent_dir = tmp_path / "agents" / "omp" / "agent"
     path = {
         "home": user_agent.parent.parent / ".env",
         "config-root": user_agent.parent / ".env",
+        "profile-root": user_agent.parent / "profiles" / "work" / ".env",
         "project": project / ".env",
-        "session-agent": agent_dir / ".env",
+        "user-agent": user_agent / ".env",
         "project/.env.local": project / ".env.local",
         "project/.env.development": project / ".env.development",
     }[where]
     path.parent.mkdir(parents = True, exist_ok = True)
     path.write_text(f"# a comment\n{line}\n")
-    # omp fills an unset variable from these files (utils/src/env.ts:384-392), so it stays set,
-    # to a folder of this project's own.
-    pinned = agent_dir / "sessions-pinned" / hashlib.sha256(str(project).encode()).hexdigest()[:16]
-    _assert_env_set(_invoke_omp_url(), "PI_CODING_AGENT_SESSION_DIR", str(pinned))
 
 
-@pytest.mark.parametrize(("where", "line"), [
-    ("home", "PI_CODING_AGENT_SESSION_DIR="),
-    ("home", "# PI_CODING_AGENT_SESSION_DIR=/elsewhere"),
-    # omp reads <agentDir>/.env from the session agent dir, not from yours.
-    ("user-agent", "PI_CODING_AGENT_SESSION_DIR=/elsewhere"),
-    # Bun's own loading maps no OMP_ names (utils/src/env.ts:279-284 is omp's).
-    ("project/.env.local", "OMP_CODING_AGENT_SESSION_DIR=/elsewhere"),
+@pytest.mark.parametrize(("where", "line", "expected"), [
+    # Only the user's own omp reads these: the session omp has its own agent dir, and runs on
+    # the default profile (utils/src/env.ts:288-293).
+    ("user-agent", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", "/elsewhere"),
+    ("user-agent", 'export OMP_CODING_AGENT_SESSION_DIR="/elsewhere"', "/elsewhere"),
+    ("profile-root", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", "/elsewhere"),
+    # Read as omp's parseEnv reads it: a # ends an unquoted value, and $ is never expanded.
+    ("user-agent", "PI_CODING_AGENT_SESSION_DIR='/else#where' # mine", "/else#where"),
+    ("user-agent", "PI_CODING_AGENT_SESSION_DIR=/elsewhere#mine", "/elsewhere"),
+    ("user-agent", "PI_CODING_AGENT_SESSION_DIR=$HOME/elsewhere", "$HOME/elsewhere"),
+    ("user-agent", "PI_CODING_AGENT_SESSION_DIR=", None),
+    ("user-agent", "# PI_CODING_AGENT_SESSION_DIR=/elsewhere", None),
+    # The session omp loads these itself, as the user's omp does.
+    ("home", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", None),
+    ("config-root", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", None),
+    ("project", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", None),
+    ("project/.env.local", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", None),
+    ("project/.env.development", "PI_CODING_AGENT_SESSION_DIR=/elsewhere", None),
 ])
-def test_omp_url_keeps_per_project_sessions_without_such_a_dotenv(fake_vllm, tmp_path, monkeypatch, omp_url_user, where, line):
+def test_omp_url_exports_a_session_dir_only_your_own_omp_would_read(fake_vllm, tmp_path, monkeypatch, omp_url_user, where, line, expected):
     user_agent, _ = omp_url_user
-    project = tmp_path / "project"
-    project.mkdir()
-    monkeypatch.chdir(project)
-    path = {
-        "home": user_agent.parent.parent / ".env",
-        "user-agent": user_agent / ".env",
-        "project/.env.local": project / ".env.local",
-    }[where]
-    path.write_text(f"{line}\n")
-    _assert_env_unset(_invoke_omp_url(), "PI_CODING_AGENT_SESSION_DIR")
+    if where == "profile-root":
+        (user_agent.parent / "profiles" / "work" / "agent").mkdir(parents = True)
+        monkeypatch.setenv("OMP_PROFILE", "work")
+    _write_omp_dotenv(tmp_path, monkeypatch, user_agent, where, line)
+    output = _invoke_omp_url()
+    if expected is None:
+        assert "PI_CODING_AGENT_SESSION_DIR" not in output
+    else:
+        _assert_env_set(output, "PI_CODING_AGENT_SESSION_DIR", _shell(expected))
+
+
+@pytest.mark.parametrize("where", ["project", "project/.env.local"])
+def test_omp_url_leaves_a_session_dir_the_project_gives_first_to_omp(fake_vllm, tmp_path, monkeypatch, omp_url_user, where):
+    user_agent, _ = omp_url_user
+    (user_agent / ".env").write_text("PI_CODING_AGENT_SESSION_DIR=/from-agent-dir\n")
+    # Bun's and the project's files fill the variable before the agent dir's (utils/src/env.ts:
+    # 162-167,384-392), so exporting that one would override what omp picks natively.
+    _write_omp_dotenv(tmp_path, monkeypatch, user_agent, where, "PI_CODING_AGENT_SESSION_DIR=/from-project")
+    assert "PI_CODING_AGENT_SESSION_DIR" not in _invoke_omp_url()
+
+
+def test_omp_url_shell_session_dir_passes_through(fake_vllm, tmp_path, monkeypatch, omp_url_user):
+    user_agent, _ = omp_url_user
+    (user_agent / ".env").write_text("PI_CODING_AGENT_SESSION_DIR=/elsewhere\n")
+    # Bun and omp keep a non-empty launcher value (utils/src/env.ts:204-206,387).
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "mine"))
+    assert "PI_CODING_AGENT_SESSION_DIR" not in _invoke_omp_url()
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason = "omp reads XDG dirs on Linux/macOS")
+@pytest.mark.parametrize("is_default_agent_dir", [True, False])
+def test_omp_url_links_the_session_stores_omp_keeps_under_xdg(fake_vllm, tmp_path, monkeypatch, omp_url_user, is_default_agent_dir):
+    user_agent, _ = omp_url_user
+    if not is_default_agent_dir:
+        user_agent = tmp_path / "custom-agent"
+        user_agent.mkdir()
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(user_agent))
+    (tmp_path / "xdg-data" / "omp").mkdir(parents = True)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    # Without an omp dir there, omp keeps its state in the agent dir (utils/src/dirs.ts:397).
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    _run_omp_url()
+    agent_dir = tmp_path / "agents" / "omp" / "agent"
+    # Only the default agent dir moves to XDG (utils/src/dirs.ts:368,385).
+    data = tmp_path / "xdg-data" / "omp" if is_default_agent_dir else user_agent
+    for name in ("sessions", "blobs", "archive"):
+        assert (agent_dir / name).resolve() == data / name
+    for name in ("terminal-sessions", "custom-session-files"):
+        assert (agent_dir / name).resolve() == user_agent / name
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason = "omp reads XDG dirs on Linux/macOS")
+@pytest.mark.parametrize(("where", "has_omp_dir"), [("home", True), ("user-agent", True), ("home", False)])
+@pytest.mark.parametrize("mode", ["url", "native"])
+def test_omp_refuses_an_xdg_dir_a_dotenv_would_move_your_history_to(fake_vllm, tmp_path, monkeypatch, omp_url_user, where, has_omp_dir, mode):
+    user_agent, source = omp_url_user
+    xdg = tmp_path / "xdg-state"
+    if has_omp_dir:
+        (xdg / "omp").mkdir(parents = True)
+    # omp re-reads its dirs after loading the .env files (utils/src/env.ts:394-400).
+    _write_omp_dotenv(tmp_path, monkeypatch, user_agent, where, f"XDG_STATE_HOME={xdg}")
+    if mode == "native":
+        _native_no_connect(monkeypatch)
+        args = ["omp", "--no-launch", "--skill", str(source)]
+    else:
+        args = ["omp", "--url", BASE, "--no-launch"]
+    result = CliRunner().invoke(start.start_app, args)
+    assert result.exit_code == (1 if has_omp_dir else 0), result.output
+    if has_omp_dir:
+        assert "XDG_STATE_HOME" in result.output and str(xdg / "omp") in result.output
+
+
+@pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason = "omp reads XDG dirs on Linux/macOS")
+@pytest.mark.parametrize(("lines", "is_refused"), [
+    # Bun's file fills it first, and omp fills only an unset name (utils/src/env.ts:384-392).
+    ({"project/.env.local": "XDG_STATE_HOME={tmp}/nowhere", "home": "XDG_STATE_HOME={tmp}/x"}, False),
+    # Bun expands $VAR and ${VAR} in the project's files (utils/src/env.ts:138-152).
+    ({"project/.env.local": "XDG_STATE_HOME=$HOME/.local/state"}, True),
+    ({"project": "XDG_STATE_HOME=${{HOME}}/.local/state"}, True),
+])
+def test_omp_xdg_check_follows_the_value_your_omp_ends_up_with(fake_vllm, tmp_path, monkeypatch, omp_url_user, lines, is_refused):
+    user_agent, _ = omp_url_user
+    for xdg in (tmp_path / "x", user_agent.parent.parent / ".local" / "state"):
+        (xdg / "omp").mkdir(parents = True)
+    for where, line in lines.items():
+        _write_omp_dotenv(tmp_path, monkeypatch, user_agent, where, line.format(tmp = tmp_path))
+    result = CliRunner().invoke(start.start_app, ["omp", "--url", BASE, "--no-launch"])
+    assert result.exit_code == (1 if is_refused else 0), result.output
+
+
+@pytest.mark.parametrize(("where", "native"), [("home", "/from-home"), ("profile-root", "/from-profile"), (None, None)])
+def test_omp_url_profile_session_does_not_follow_the_default_root_dotenv(fake_vllm, tmp_path, monkeypatch, omp_url_user, where, native):
+    user_agent, _ = omp_url_user
+    (user_agent.parent / "profiles" / "work" / "agent").mkdir(parents = True)
+    monkeypatch.setenv("OMP_PROFILE", "work")
+    # The session's omp runs on the default profile, so it reads ~/.omp/.env, which the work
+    # profile does not (utils/src/env.ts:291).
+    _write_omp_dotenv(tmp_path, monkeypatch, user_agent, "config-root", "PI_CODING_AGENT_SESSION_DIR=/from-default")
+    if where:
+        _write_omp_dotenv(tmp_path, monkeypatch, user_agent, where, f"PI_CODING_AGENT_SESSION_DIR={native}")
+    result = CliRunner().invoke(start.start_app, ["omp", "--url", BASE, "--no-launch"])
+    if native:
+        assert result.exit_code == 0, result.output
+        _assert_env_set(result.output, "PI_CODING_AGENT_SESSION_DIR", native)
+    else:
+        # Leaving it unset means one folder per project, which no value can say.
+        assert result.exit_code == 1
+        assert str(user_agent.parent / ".env") in result.output
+
+
+@pytest.mark.parametrize("can_copy", [True, False])
+def test_omp_url_copies_your_secret_key_when_it_cannot_link_it(fake_vllm, tmp_path, monkeypatch, omp_url_user, can_copy):
+    user_agent, _ = omp_url_user
+    (user_agent / "secret-placeholder.key").write_text("k" * 43)
+    # No file symlinks, and a hard link across disks fails.
+    _refuse_file_links(monkeypatch)
+    monkeypatch.setattr(os, "link", lambda *args: (_ for _ in ()).throw(OSError("cross-device link")))
+    if not can_copy:
+        real = omp_agent._write_private_text
+
+        def write_private_text(path, text):
+            if "secret-placeholder" in path.name:
+                raise OSError("read-only")
+            real(path, text)
+
+        monkeypatch.setattr(omp_agent, "_write_private_text", write_private_text)
+    key = tmp_path / "agents" / "omp" / "agent" / "secret-placeholder.key"
+    for _ in range(2):
+        result = CliRunner().invoke(start.start_app, ["omp", "--url", BASE, "--no-launch"])
+        # The key is no history, and a session without it only redacts with a key of its own.
+        assert result.exit_code == 0, result.output
+    if can_copy:
+        assert key.read_text() == "k" * 43 and not key.is_symlink()
+        assert stat.S_IMODE(key.stat().st_mode) == 0o600
+        # The copy an earlier run made stays; it is not moved aside as session data.
+        assert not any(".agent-switch-old" in path.name for path in key.parent.iterdir())
+    else:
+        assert not os.path.lexists(key)
+        assert "Warning" in result.output and "secret-placeholder.key" in result.output
+
+
+def test_omp_url_moves_a_persisted_session_history_aside(fake_vllm, tmp_path, omp_url_user):
+    user_agent, _ = omp_url_user
+    agent_dir = tmp_path / "agents" / "omp" / "agent"
+    (agent_dir / "sessions" / "project").mkdir(parents = True)
+    (agent_dir / "sessions" / "project" / "old.jsonl").write_text("old\n")
+    result = CliRunner().invoke(start.start_app, ["omp", "--url", BASE, "--no-launch", "--persist"])
+    assert result.exit_code == 0, result.output
+    assert (agent_dir / "sessions").resolve() == user_agent / "sessions"
+    assert (agent_dir / "sessions.agent-switch-old" / "project" / "old.jsonl").read_text() == "old\n"
+    assert str(agent_dir / "sessions.agent-switch-old") in result.output
 
 
 def test_omp_url_session_follows_a_named_profile(fake_vllm, tmp_path, monkeypatch, omp_url_user):
@@ -576,6 +756,8 @@ def test_omp_url_session_follows_a_named_profile(fake_vllm, tmp_path, monkeypatc
     agent_dir = tmp_path / "agents" / "omp" / "agent"
     assert (agent_dir / "commands").resolve() == profile_agent / "commands"
     assert not os.path.lexists(agent_dir / "skills")
+    # A profile's sessions move to XDG only with its own dir there (utils/src/dirs.ts:392-395).
+    assert (agent_dir / "sessions").resolve() == profile_agent / "sessions"
 
 
 @pytest.mark.parametrize(("flags", "level"), [
@@ -934,7 +1116,8 @@ def test_omp_url_pins_the_config_root_agent_switch_resolved(fake_vllm, tmp_path,
     # (utils/src/env.ts:204-206); one that sets it is refused instead.
     output = _invoke_omp_url()
     _assert_env_set(output, "PI_CONFIG_DIR", ".omp-alt")
-    assert "PI_CODING_AGENT_SESSION_DIR=" in output and "unset PI_CODING_AGENT_SESSION_DIR" not in output
+    # The session omp reads that root's .env itself.
+    assert "PI_CODING_AGENT_SESSION_DIR" not in output
 
 
 def test_omp_url_fails_closed_on_an_unreadable_user_settings_file(fake_vllm, tmp_path, omp_url_user):
@@ -957,33 +1140,6 @@ def test_omp_url_reads_the_user_settings_with_yaml_1_2_scalars(fake_vllm, tmp_pa
 
 
 # ── Rework 3 ─────────────────────────────────────────────────────────
-
-
-def _pinned(agent_dir, project) -> Path:
-    return agent_dir / "sessions-pinned" / hashlib.sha256(str(project).encode()).hexdigest()[:16]
-
-
-@pytest.mark.parametrize("spelling", ["split", "equals", "relative"])
-def test_omp_url_pins_a_session_dir_per_cwd_omp_runs_in(fake_vllm, tmp_path, monkeypatch, omp_url_user, spelling):
-    user_agent, _ = omp_url_user
-    (user_agent.parent.parent / ".env").write_text("PI_CODING_AGENT_SESSION_DIR=/elsewhere\n")
-    launch = tmp_path / "launch"
-    for name in ("a", "b"):
-        (launch / name).mkdir(parents = True)
-    monkeypatch.chdir(launch)
-    agent_dir = tmp_path / "agents" / "omp" / "agent"
-
-    def cwd_args(name):
-        target = name if spelling == "relative" else str(launch / name)
-        return [f"--cwd={target}"] if spelling == "equals" else ["--cwd", target]
-
-    # omp runs in --cwd, resolved from the launch dir (src/cli/startup-cwd.ts:48-68).
-    for name in ("a", "b"):
-        output = _invoke_omp_url("--persist", "--", *cwd_args(name))
-        _assert_env_set(output, "PI_CODING_AGENT_SESSION_DIR", str(_pinned(agent_dir, launch / name)))
-    # A --cwd after a passthrough -- is a message for omp, not a flag.
-    output = _invoke_omp_url("--persist", "--", "--", "--cwd", "a")
-    _assert_env_set(output, "PI_CODING_AGENT_SESSION_DIR", str(_pinned(agent_dir, launch)))
 
 
 def _refuse_file_links(monkeypatch):
@@ -1026,6 +1182,36 @@ def test_omp_url_stops_when_secret_rules_cannot_reach_the_session(fake_vllm, tmp
     # omp reads the rules only from its active agent dir (src/secrets/index.ts:166-174).
     assert result.exit_code == (1 if is_enabled else 0), result.output
     assert "secrets.yml" in result.output
+
+
+@pytest.mark.parametrize("where", [
+    "agent-dir",
+    pytest.param("xdg-state", marks = pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason = "XDG")),
+    # A legacy key omp has not moved to XDG yet (utils/src/dirs.ts:1075-1115).
+    pytest.param("xdg-legacy", marks = pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason = "XDG")),
+])
+def test_omp_url_links_your_secret_placeholder_key_only_when_you_have_one(fake_vllm, tmp_path, monkeypatch, omp_url_user, where):
+    user_agent, _ = omp_url_user
+    # Whether or not secrets are on: a project or the session can turn them on too
+    # (src/config/settings.ts:1404-1405).
+    xdg_state = tmp_path / "xdg-state" / "omp"
+    if where != "agent-dir":
+        xdg_state.mkdir(parents = True)
+        monkeypatch.setenv("XDG_STATE_HOME", str(xdg_state.parent))
+    user_key = (xdg_state if where == "xdg-state" else user_agent) / "secret-placeholder.key"
+    key = tmp_path / "agents" / "omp" / "agent" / "secret-placeholder.key"
+    _run_omp_url()
+    # Without a key of yours, omp makes the session its own; nothing appears on your side.
+    assert not os.path.lexists(key)
+    assert not any(path.name == "secret-placeholder.key" for path in tmp_path.rglob("*"))
+    user_key.write_text("k" * 43)
+    _run_omp_url()
+    # The same key, so a shared session shows the same secret placeholders.
+    assert key.resolve() == user_key
+    user_key.unlink()
+    _run_omp_url()
+    # A link to a removed key would stop omp from making its own (src/secrets/index.ts:36-50).
+    assert not os.path.lexists(key)
 
 
 @pytest.mark.parametrize(("where", "line"), [
@@ -1112,7 +1298,7 @@ def test_omp_session_yaml_keeps_a_date_omp_wrote_unquoted(fake_vllm, tmp_path, o
     assert _omp_session_config(tmp_path)["tools"]["restrictedFolders"] == ["2026-11-12", "/new"]
 
 
-@pytest.mark.parametrize("setup", ["broken-settings", "dotenv-profile", "dotenv-dir"])
+@pytest.mark.parametrize("setup", ["broken-settings", "dotenv-profile", "dotenv-dir", "profile-session-dir"])
 def test_omp_url_refusals_come_before_connecting(fake_vllm, tmp_path, monkeypatch, omp_url_user, setup):
     user_agent, _ = omp_url_user
     project = tmp_path / "project"
@@ -1122,6 +1308,10 @@ def test_omp_url_refusals_come_before_connecting(fake_vllm, tmp_path, monkeypatc
         (user_agent / "config.yml").write_text("tools: [unclosed\n")
     elif setup == "dotenv-profile":
         (project / ".env").write_text("OMP_PROFILE=work\n")
+    elif setup == "profile-session-dir":
+        (user_agent.parent / "profiles" / "work" / "agent").mkdir(parents = True)
+        monkeypatch.setenv("OMP_PROFILE", "work")
+        (user_agent.parent / ".env").write_text("PI_CODING_AGENT_SESSION_DIR=/from-default\n")
     else:
         (project / ".env").write_text("PI_CONFIG_DIR=.omp-work\n")
     calls = []
@@ -1189,14 +1379,15 @@ def test_omp_url_secret_rules_stop_comes_before_connecting(fake_vllm, tmp_path, 
 
 @pytest.mark.parametrize(("line", "shell"), [
     ("PI_CONFIG_DIR=.omp-work", ("PI_CONFIG_DIR", ".omp-work")),
-    ("OMP_CODING_AGENT_DIR=/dotfiles/omp-agent", ("PI_CODING_AGENT_DIR", "/dotfiles/omp-agent")),
+    # Under tmp, since the session links its session stores into that agent dir.
+    ("OMP_CODING_AGENT_DIR={tmp}/dotfiles/omp-agent", ("PI_CODING_AGENT_DIR", "{tmp}/dotfiles/omp-agent")),
 ])
 @pytest.mark.parametrize("mode", ["url", "native"])
 def test_omp_dotenv_dir_counts_for_nothing_when_the_shell_sets_it(fake_vllm, tmp_path, monkeypatch, omp_url_user, line, shell, mode):
     user_agent, source = omp_url_user
     # A non-empty launcher value wins over every dotenv file (utils/src/env.ts:204-206,387).
-    (user_agent.parent.parent / ".env").write_text(f"{line}\n")
-    monkeypatch.setenv(*shell)
+    (user_agent.parent.parent / ".env").write_text(f"{line.format(tmp = tmp_path)}\n")
+    monkeypatch.setenv(shell[0], shell[1].format(tmp = tmp_path))
     if mode == "native":
         _native_no_connect(monkeypatch)
         args = ["omp", "--no-launch", "--skill", str(source)]
