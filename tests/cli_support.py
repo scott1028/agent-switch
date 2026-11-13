@@ -109,7 +109,7 @@ def _dsh_entries(path):
 
 
 # The temp-dir agents: --persist points each one's home/state env at the stable dir;
-# without it, at an ephemeral temp path. opencode is handled separately (only its
+# without it (for codex, with --no-persist), at an ephemeral temp path. opencode is handled separately (only its
 # config overlay is relocated; its session data was never in the temp dir).
 _RESUME_ENV_VAR = {
     "codex": "CODEX_HOME",
@@ -158,6 +158,9 @@ def _assert_windows_agent_copies_injected_skills(fake_vllm, tmp_path, monkeypatc
     result = CliRunner().invoke(start.start_app, [*args, "--skill", str(source), "--skill", f"renamed:{source}"])
     assert result.exit_code == 0, result.output
     session = tmp_path / "agents" / (agent if is_routed else f"{agent}-native")
+    if agent == "codex":
+        # A Windows codex keeps a dir of its own, apart from a Linux codex's links.
+        session = session.with_name(f"{session.name}-windows")
     root = session / {
         "claude": "agent-switch/.claude/skills", "codex": "skills" if is_routed else "home/skills",
         "opencode": "skills", "pi": ".pi/agent/skills" if is_routed else "agent/skills",

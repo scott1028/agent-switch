@@ -3,6 +3,7 @@
 
 """`agent-switch codex`: Codex config/catalog writers, overlays and subagent bridge."""
 
+import hashlib
 import json
 import os
 import re
@@ -32,7 +33,7 @@ from agent_switch.core.launch import (
     _run_native,
 )
 from agent_switch.core.mcp import load_mcp_servers
-from agent_switch.core.overlay import write_native_overlay
+from agent_switch.core.overlay import link_user_store, remove_native_overlay, write_native_overlay
 from agent_switch.core.options import (
     LoadOptions,
     ProviderName,
@@ -53,7 +54,7 @@ from agent_switch.core.options import (
     _MIN_P_OPTION,
     _MODEL_LOAD_OPTION,
     _MODEL_OPTION,
-    _PERSIST_OPTION,
+    _PANEL_SESSION,
     _PRESENCE_PENALTY_OPTION,
     _PROVIDER_OPTION,
     _REASONING_EFFORT_OPTION,
@@ -74,6 +75,7 @@ from agent_switch.core.options import (
     _yolo_command_flags,
 )
 from agent_switch.core.platform import (
+    _is_junction,
     _looks_like_path,
     _remove_overlay_entry,
     _wsl_windows_executable,
@@ -111,6 +113,34 @@ _CODEX_SUBAGENT_CONFIG_ENV = "AGENT_SWITCH_CODEX_SUBAGENT_CONFIG"
 
 
 _CODEX_PARENT_OVERLAY_MANIFEST = ".agent-switch-parent-overlay.json"
+
+
+# The user's own thread history in their CODEX_HOME, which every session links instead of keeping
+# its own: rollouts (references/codex/codex-rs/rollout/src/lib.rs:86-87), the writer locks
+# (rollout/src/writer_lock.rs:17), the thread name index (rollout/src/session_index.rs:20) and
+# the prompt history (message-history/src/lib.rs:52). The SQLite state is never linked; it
+# follows CODEX_SQLITE_HOME instead.
+_CODEX_USER_SESSION_DIRS = ("sessions", "archived_sessions", "thread-writer-locks")
+_CODEX_USER_SESSION_FILES = ("session_index.jsonl", "history.jsonl")
+
+
+# codex records each thread's rollout path through CODEX_HOME
+# (references/codex/codex-rs/rollout/src/recorder.rs:1770-1791) and never rewrites a recorded
+# one (rollout/src/state_db.rs:563-567,622-627), so a session that shares your history keeps its
+# home between runs; --no-persist is a throwaway that shares nothing.
+_CODEX_PERSIST_OPTION = typer.Option(
+    None,
+    "--persist/--no-persist",
+    rich_help_panel = _PANEL_SESSION,
+    help = "Keep the session dir and share your codex history (on by default; --no-persist: "
+    "throwaway and isolated).",
+)
+
+
+_CODEX_WSL_HISTORY_NOTE = (
+    "Note: codex runs as a Windows program, which can't follow links into WSL, so this session "
+    "keeps its own history instead of sharing yours."
+)
 
 
 _CODEX_SUBAGENT_TOOL_DESCRIPTION = (
@@ -509,14 +539,88 @@ def _codex_source_home(*, ignore_configured: bool = False) -> Path:
     return Path.home() / ".codex"
 
 
+def _get_codex_session_name(
+    base: str, *, persist: bool, launch: bool, alias: Optional[str] = None,
+) -> str:
+    """The session dir name for base: a kept dir per codex home, since a thread's recorded path
+    runs through it (rollout/src/recorder.rs:1770-1791), and a --no-persist or Windows codex
+    dir of its own."""
+    name = alias or base
+    if not persist:
+        # A launch's throwaway dir takes the name only as a prefix.
+        return name if launch else f"{name}-isolated"
+    if _wsl_windows_executable(["codex"]):
+        # A Windows codex shares nothing, so it never meets a Linux codex's links.
+        return f"{name}-windows"
+    if alias or not os.environ.get("CODEX_HOME"):
+        # An alias always shares ~/.<alias>.
+        return name
+    source = str(_codex_source_home().resolve(strict = False))
+    if source == str((Path.home() / ".codex").resolve(strict = False)):
+        return name
+    return f"{name}-{hashlib.sha256(source.encode()).hexdigest()[:8]}"
+
+
+def _share_codex_sqlite_home(source_home: Path, env: dict) -> None:
+    # codex opens its SQLite state in the config's sqlite_home, else CODEX_SQLITE_HOME, else
+    # CODEX_HOME (references/codex/codex-rs/core/src/config/mod.rs:276-286,4310-4315). A WAL
+    # database must not open through a link, so point codex at the user's home, unless the
+    # shell already names one.
+    if not (os.environ.get("CODEX_SQLITE_HOME") or "").strip():
+        env["CODEX_SQLITE_HOME"] = str(source_home)
+
+
+def write_codex_user_sessions(home: Path, env: dict, *, alias: Optional[str] = None) -> bool:
+    """Link the user's own codex thread history into the session CODEX_HOME, so native codex
+    and this session resume each other's threads; never copies. A codex-<x> alias shares
+    ~/.<alias>, by the usual convention. False when this session keeps its own history."""
+    if _wsl_windows_executable(["codex"]):
+        typer.echo(_CODEX_WSL_HISTORY_NOTE)
+        return False
+    source_home = Path.home() / f".{alias}" if alias else _codex_source_home()
+    if alias and not source_home.is_dir():
+        typer.echo(
+            f"Note: {source_home} is not a directory, so this session keeps its own history "
+            "instead of sharing it."
+        )
+        return False
+    for name in (*_CODEX_USER_SESSION_DIRS, *_CODEX_USER_SESSION_FILES):
+        if not link_user_store(
+            source_home / name, home / name, is_file = name in _CODEX_USER_SESSION_FILES,
+        ):
+            _fail(
+                f"Couldn't link your codex {source_home / name} into the session "
+                f"({home / name}), and agent-switch never copies session history; fix that and "
+                "re-run."
+            )
+    _share_codex_sqlite_home(source_home, env)
+    return True
+
+
+def _drop_codex_user_session_links(home: Path) -> None:
+    """Drop the links to the user's history a sharing run left in a kept home; real history the
+    session wrote stays."""
+    for name in (*_CODEX_USER_SESSION_DIRS, *_CODEX_USER_SESSION_FILES):
+        target = home / name
+        # agent-switch makes a hard link only to the user's own file.
+        if target.is_symlink() or _is_junction(target) or (
+            target.is_file() and target.stat().st_nlink > 1
+        ):
+            _remove_overlay_entry(target)
+
+
 def write_codex_parent_overlay(
     overlay: Path,
     *,
     routing: Optional[str] = _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS,
     skills: Optional[dict] = None,
     should_copy_skills: bool = False,
+    env: Optional[dict] = None,
+    should_share_history: bool = True,
 ) -> Path:
-    """Preserve the user's Codex home while adding session routing or injected skills."""
+    """Preserve the user's Codex home while adding session routing or injected skills; the
+    user's thread history is linked, and env gets the SQLite home that goes with it, unless
+    should_share_history is off."""
     manifest_path = overlay / _CODEX_PARENT_OVERLAY_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding = "utf-8"))
@@ -535,12 +639,32 @@ def write_codex_parent_overlay(
                 source_home = _codex_source_home(ignore_configured = True)
         else:
             source_home = _codex_source_home(ignore_configured = True)
+    is_windows_codex = bool(_wsl_windows_executable(["codex"]))
+    is_shared = should_share_history and not is_windows_codex
+    if is_windows_codex:
+        typer.echo(_CODEX_WSL_HISTORY_NOTE)
+    if is_shared and env is not None:
+        _share_codex_sqlite_home(source_home, env)
+    elif not is_shared:
+        # An overlay of its own that shares nothing: drop links a sharing run could have left.
+        _drop_codex_user_session_links(overlay)
+    # Never a SQLite file: its -wal and -shm would land beside the link.
+    sqlite = (
+        tuple(child.name for child in source_home.iterdir() if ".sqlite" in child.name)
+        if source_home.is_dir() else ()
+    )
     write_native_overlay(
         overlay, source_home, manifest_name = _CODEX_PARENT_OVERLAY_MANIFEST,
-        excluded = ("AGENTS.md", "AGENTS.override.md") if routing is not None else (),
-        copy_directories = {"agents", "skills", "rules", "plugins", "marketplaces", "sessions"},
+        excluded = (
+            *(("AGENTS.md", "AGENTS.override.md") if routing is not None else ()), *sqlite,
+            # Nothing of the user's history: not as a link of its own, nor as an ordinary entry.
+            *(() if is_shared else (*_CODEX_USER_SESSION_DIRS, *_CODEX_USER_SESSION_FILES)),
+        ),
+        copy_directories = {"agents", "skills", "rules", "plugins", "marketplaces"},
         skills = skills,
         should_copy_skills = should_copy_skills,
+        shared = _CODEX_USER_SESSION_DIRS if is_shared else (),
+        shared_files = _CODEX_USER_SESSION_FILES if is_shared else (),
     )
 
     if routing is None:
@@ -631,7 +755,7 @@ def codex(
     url: Optional[list[str]] = _URL_OPTION,
     provider: Optional[ProviderName] = _PROVIDER_OPTION,
     yolo: bool = _YOLO_OPTION,
-    persist: bool = _PERSIST_OPTION,
+    persist: Optional[bool] = _CODEX_PERSIST_OPTION,
     as_subagent: bool = _AS_SUBAGENT_OPTION,
     mcp: Optional[list[str]] = _MCP_OPTION,
     mcp_all: bool = _MCP_ALL_OPTION,
@@ -657,6 +781,8 @@ def codex(
     )
     skills = load_skills(skill, skill_set, as_subagent = as_subagent)
     target, headers = _resolve_target(url, provider, api_key, header, ctx = ctx, launch = launch)
+    raw_persist = persist
+    persist = True if persist is None else persist
     if target is None:
         _refuse_local_only(
             model = model,
@@ -674,7 +800,8 @@ def codex(
             header = header,
             model_load = model_load,
             as_subagent = as_subagent,
-            persist = persist,
+            persist = raw_persist,
+            persist_default = None,
         )
     alias = ctx.meta.get(_ALIAS_META)
     if alias and as_subagent:
@@ -684,16 +811,9 @@ def codex(
             "--skill and --skill-set are not supported for codex aliases: the alias sets "
             "its own CODEX_HOME; use `agent-switch codex`."
         )
-    if alias and target is not None:
-        # The function sets its own CODEX_HOME, which outranks the session env, so the session
-        # config with the local provider and key would be silently ignored.
-        _fail(
-            "codex aliases run natively only: the alias sets its own CODEX_HOME, so --url cannot "
-            "route it; drop --url/--provider or use `agent-switch codex`."
-        )
     install_hint = _npm_install_hint("@openai/codex")
     executable = None
-    if alias:
+    if alias and target is None:
         _check_alias(alias)
     else:
         executable = _require_agent_for_launch("codex", install_hint, launch)
@@ -712,19 +832,28 @@ def codex(
                 f"0.117.0 or newer is needed. Upgrade it with: {install_hint}"
             )
         # Without injected skills, native launch leaves CODEX_HOME untouched.
-        with _session_config("codex-native", launch) as config:
+        # A --skill overlay is kept, so the threads codex records through it stay resumable.
+        session_name = _get_codex_session_name("codex-native", persist = True, launch = launch)
+        with _session_config(session_name, launch, persist = bool(skills)) as config:
             env = {}
             mcp_flags = _codex_native_mcp_flags(config, mcp_servers or {}, env)
             skill_flags = []
             if skills:
                 home = write_codex_parent_overlay(
                     config / "home", routing = None, skills = skills,
-                    should_copy_skills = should_copy_skills,
+                    should_copy_skills = should_copy_skills, env = env,
                 )
                 env["CODEX_HOME"] = str(home)
                 skill_flags = _get_codex_skill_flags(home / "skills", skills)
             else:
-                _remove_overlay_entry(config / "home")
+                # Threads codex wrote into an earlier overlay are moved aside, never removed, and
+                # the history links stay for the threads it recorded through them.
+                remove_native_overlay(
+                    config / "home",
+                    shared = (*_CODEX_USER_SESSION_DIRS, *_CODEX_USER_SESSION_FILES),
+                    manifest_name = _CODEX_PARENT_OVERLAY_MANIFEST,
+                    should_keep_shared_links = True,
+                )
             command = _agent_command(
                 alias,
                 "codex",
@@ -779,7 +908,8 @@ def codex(
             err = True,
         )
     if as_subagent:
-        with _session_config("codex-subagent", launch, persist = persist) as home:
+        session_name = _get_codex_session_name("codex-subagent", persist = persist, launch = launch)
+        with _session_config(session_name, launch, persist = persist) as home:
             bridge_config = write_codex_subagent_bridge(
                 base,
                 key,
@@ -790,7 +920,10 @@ def codex(
                 headers = headers,
                 compact_at = compact_at,
             )
-            parent_home = write_codex_parent_overlay(home / "parent")
+            parent_env = {}
+            parent_home = write_codex_parent_overlay(
+                home / "parent", env = parent_env, should_share_history = persist,
+            )
             command = [
                 "codex",
                 *_codex_subagent_flags(bridge_config),
@@ -803,14 +936,21 @@ def codex(
             _run(
                 base,
                 entry,
-                {"CODEX_HOME": str(parent_home)},
+                {"CODEX_HOME": str(parent_home), **parent_env},
                 command,
                 launch = launch,
                 install_hint = install_hint,
+                # A throwaway parent shares nothing, through an inherited one either.
+                unset_env = () if persist else ("CODEX_SQLITE_HOME",),
             )
         return
     served_models = _get_served_models(target, key, entry["id"])
-    with _session_config("codex", launch, persist = persist) as home:
+    # A codex-<x> alias gets its own kept home and runs plain codex, since the alias would set
+    # its own CODEX_HOME over the session's.
+    session_name = _get_codex_session_name(
+        "codex", persist = persist, launch = launch, alias = alias,
+    )
+    with _session_config(session_name, launch, persist = persist) as home:
         write_codex_config(
             base, entry, home, codex_effort, headers, compact_at, mcp_servers, served_models
         )
@@ -829,6 +969,15 @@ def codex(
             ),
         ]
         env = {_CODEX_ENV_KEY: key, "CODEX_HOME": str(home)}
+        # CODEX_HOME stays the session's, so a /model pick lands in its agent_switch profile.
+        unset_env = _CODEX_ENV_UNSET
+        if not persist or _wsl_windows_executable(["codex"]):
+            # A kept --no-persist or Windows codex dir is its own, never the shared one; drop
+            # links a sharing run could have left there.
+            _drop_codex_user_session_links(home)
+        if not (persist and write_codex_user_sessions(home, env, alias = alias)):
+            # Its own history only, so an inherited SQLite home must not record its threads.
+            unset_env = (*_CODEX_ENV_UNSET, "CODEX_SQLITE_HOME")
         _run(
             base,
             entry,
@@ -836,5 +985,5 @@ def codex(
             command,
             launch = launch,
             install_hint = install_hint,
-            unset_env = _CODEX_ENV_UNSET,
+            unset_env = unset_env,
         )

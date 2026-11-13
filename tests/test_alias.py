@@ -3,6 +3,7 @@
 
 """`agent-switch <agent>-<x>`: alias resolution, the bash launch form and the refusals."""
 
+import os
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -198,7 +199,6 @@ def test_local_opencode_alias_wraps_the_local_command(fake_vllm, monkeypatch):
 @pytest.mark.parametrize(
     ("name", "needle"),
     [
-        ("codex-personal", "codex aliases run natively only"),
         ("pi-personal", "pi aliases run natively only"),
         ("dsh-x", "dsh aliases run natively only"),
         ("dsh-tui-x", "dsh-tui aliases run natively only"),
@@ -209,6 +209,26 @@ def test_local_mode_refused_for_home_owning_aliases(fake_vllm, monkeypatch, name
     result = CliRunner().invoke(start.start_app, [name, "--url", BASE, "--no-launch"])
     assert result.exit_code == 1
     assert needle in result.output
+
+
+@pytest.mark.parametrize("has_store", [True, False])
+def test_codex_alias_url_runs_plain_codex_on_the_alias_store(fake_vllm, tmp_path, monkeypatch, has_store):
+    set_start_attr(monkeypatch, "_check_alias", lambda alias: pytest.fail("plain codex runs, not the alias"))
+    store = tmp_path / "isolated-home" / ".codex-personal"
+    if has_store:
+        store.mkdir(parents = True)
+    result = CliRunner().invoke(start.start_app, ["codex-personal", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    home = tmp_path / "agents" / "codex-personal"
+    _assert_env_set(result.output, "CODEX_HOME", str(home))
+    assert _launch_command(result.output)[:4] == ["codex", "--oss", "--profile", "agent_switch"]
+    if has_store:
+        assert (home / "sessions").resolve() == store / "sessions"
+        _assert_env_set(result.output, "CODEX_SQLITE_HOME", str(store))
+    else:
+        # No such store: the session keeps its own history, and says so.
+        assert not os.path.lexists(home / "sessions") and not store.exists()
+        assert str(store) in result.output
 
 
 @pytest.mark.parametrize("name", ["claude-personal", "codex-personal", "opencode-laptop", "pi-personal"])

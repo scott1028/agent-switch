@@ -153,12 +153,20 @@ def test_session_config_serializes_normal_short_home_deletion(monkeypatch, tmp_p
     assert not home.exists()
 
 
+def test_codex_default_launch_home_is_the_stable_dir(fake_vllm, tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
+    captured = _capture_launch(monkeypatch, ["codex", "--url", BASE])
+    assert captured["env"]["CODEX_HOME"] == str(tmp_path / "agents" / "codex")
+
+
 @pytest.mark.parametrize("agent", sorted(_RESUME_ENV_VAR))
 def test_default_launch_home_is_ephemeral(agent, fake_vllm, tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name, path = None: f"/usr/local/bin/{agent}")
     if agent == "dsh":
         set_start_attr(monkeypatch, "is_deepseek_harness_executable", lambda _: True)
-    captured = _capture_launch(monkeypatch, [agent, "--url", BASE])
+    # codex keeps its home by default, so its throwaway one takes --no-persist.
+    flags = ["--no-persist"] if agent == "codex" else []
+    captured = _capture_launch(monkeypatch, [agent, "--url", BASE, *flags])
     home = captured["env"][_RESUME_ENV_VAR[agent]]
     parent = core_session._ephemeral_session_parent(agent)
     assert core_session._ephemeral_session_prefix(agent, parent) in home

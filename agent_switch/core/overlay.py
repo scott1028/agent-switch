@@ -97,21 +97,42 @@ def _link_overlay_entry(source: Path, target: Path, *, should_copy_directory: bo
     return False
 
 
-def remove_native_overlay(overlay: Path, *, shared: tuple = ()) -> None:
+def remove_native_overlay(
+    overlay: Path,
+    *,
+    shared: tuple = (),
+    manifest_name: str = ".agent-switch-native-overlay.json",
+    should_keep_shared_links: bool = False,
+) -> None:
     """Remove a native overlay, keeping its history: real history at a shared name is moved
     aside first, everything else goes, and the overlay stays only while history moved aside
-    is in it."""
+    is in it. With should_keep_shared_links, the links at shared names stay too, for an agent
+    that records paths through them, and so does the manifest, so the next run still knows a
+    hard link to the user's file."""
     if overlay.is_dir() and not overlay.is_symlink() and not core_platform._is_junction(overlay):
+        # The home write_native_overlay linked, as its manifest records it.
+        manifest = _read_json_object(overlay / manifest_name)
+        source = manifest.get("source_home") if isinstance(manifest, dict) else None
+        source = Path(source) if isinstance(source, str) and os.path.isabs(source) else None
+        kept = set()
         for name in shared:
             target = overlay / name
-            if target.is_symlink() or core_platform._is_junction(target):
-                continue
-            if (target.is_dir() and any(target.iterdir())) or (
+            is_link = target.is_symlink() or core_platform._is_junction(target)
+            with contextlib.suppress(OSError):
+                # A hard link to the user's own file is a link, not session data.
+                if not is_link and source is not None:
+                    is_link = os.path.samefile(source / name, target)
+            if is_link:
+                if should_keep_shared_links:
+                    kept.add(name)
+            elif (target.is_dir() and any(target.iterdir())) or (
                 target.is_file() and target.stat().st_size
             ):
                 _move_aside(target)
+        if should_keep_shared_links:
+            kept.add(manifest_name)
         for entry in overlay.iterdir():
-            if not _MOVED_ASIDE.fullmatch(entry.name):
+            if not _MOVED_ASIDE.fullmatch(entry.name) and entry.name not in kept:
                 core_platform._remove_overlay_entry(entry)
         if any(overlay.iterdir()):
             return

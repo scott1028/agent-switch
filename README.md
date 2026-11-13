@@ -84,7 +84,7 @@ Use these with `--url` or `--provider`:
 | `--api-key KEY` | Send an API key and save it for that server. |
 | `--no-model-load` | Use an already loaded model without loading or unloading models. |
 | `--no-launch` | Print the command instead of starting the agent. |
-| `--persist` | Keep the session's settings and state between runs. Most agents resume without it; codex needs it. |
+| `--persist` | Keep the session's settings and state between runs. On by default for codex and dsh-tui; codex needs it to resume, and `--no-persist` makes it a throwaway, isolated session. |
 | `--as-subagent` | Keep the agent's own model and add a local model as a helper. |
 | `--no-project-plans` | Keep Claude Code plans in `~/.claude/plans` instead of `<project>/.tmp`. |
 | `--global-project-plans` | Write the `<project>/.tmp` plan setting into Claude Code's global `settings.json`, so it also applies without agent-switch. `--no-global-project-plans` removes it. |

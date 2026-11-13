@@ -4,6 +4,7 @@
 
 """`agent-switch codex`: config and profile writing, overlays and subagent wiring."""
 
+import hashlib
 import json
 import os
 import shlex
@@ -16,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import agent_switch.start as start
@@ -65,17 +67,26 @@ def _snapshot_skill_tree(root):
     }
 
 
+def _make_codex_user_stores(home):
+    # A first run creates the history stores; made here, a snapshot shows no other change.
+    for name in codex_agent._CODEX_USER_SESSION_DIRS:
+        (home / name).mkdir()
+    for name in codex_agent._CODEX_USER_SESSION_FILES:
+        (home / name).write_text("")
+
+
 @pytest.fixture
 def codex_skill_sources(tmp_path, monkeypatch):
-    home = tmp_path / "user-codex"
-    home.mkdir()
+    # The default codex home, so the kept session dirs keep their plain names.
+    home = Path.home() / ".codex"
+    home.mkdir(parents = True)
     (home / "config.toml").write_text(
         'model = "cloud-model"\n[[skills.config]]\nname = "disabled"\nenabled = false\n'
     )
     (home / "auth.json").write_text('{"auth": "cloud"}\n')
     (home / "AGENTS.md").write_text("User instructions.\n")
     (home / "AGENTS.override.md").write_text("User override.\n")
-    (home / "sessions").mkdir()
+    _make_codex_user_stores(home)
     for name in ["shared", "user-only", ".system"]:
         child = home / "skills" / name
         child.mkdir(parents = True)
@@ -338,14 +349,24 @@ def test_write_codex_parent_overlay_preserves_user_state_and_instructions(tmp_pa
     (source / "config.toml").write_text('model = "cloud-model"\n')
     (source / "auth.json").write_text('{"auth": "cloud"}\n')
     (source / "sessions").mkdir()
+    for name in ("state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite"):
+        (source / name).write_text("db\n")
     (source / "AGENTS.override.md").write_text("Keep my existing instructions.\n")
     monkeypatch.setenv("CODEX_HOME", str(source))
+    env = {}
 
-    overlay = codex_agent.write_codex_parent_overlay(tmp_path / "managed" / "parent")
+    overlay = codex_agent.write_codex_parent_overlay(tmp_path / "managed" / "parent", env = env)
 
     assert (overlay / "config.toml").read_text() == 'model = "cloud-model"\n'
     assert (overlay / "auth.json").read_text() == '{"auth": "cloud"}\n'
-    assert (overlay / "sessions").is_dir()
+    # Your history, so native codex and this session resume each other's threads.
+    for name in (*codex_agent._CODEX_USER_SESSION_DIRS, *codex_agent._CODEX_USER_SESSION_FILES):
+        assert (overlay / name).is_symlink() and (overlay / name).resolve() == source / name, name
+    # A WAL database never opens through a link; codex finds yours through CODEX_SQLITE_HOME
+    # (references/codex/codex-rs/core/src/config/mod.rs:276-286,4310-4315).
+    for name in ("state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite"):
+        assert not os.path.lexists(overlay / name), name
+    assert env == {"CODEX_SQLITE_HOME": str(source)}
     instructions = (overlay / "AGENTS.override.md").read_text()
     assert instructions.startswith("Keep my existing instructions.\n")
     assert codex_agent._CODEX_SUBAGENT_ROUTING_INSTRUCTIONS in instructions
@@ -405,8 +426,16 @@ def test_write_codex_parent_overlay_refreshes_fallback_copies(tmp_path, monkeypa
         raise OSError("symlinks unavailable")
 
     monkeypatch.setattr(Path, "symlink_to", deny_symlink)
-    set_start_attr(monkeypatch, "_create_directory_junction", lambda source, target: False)
+
+    def create_junction(junction_source, junction_target):
+        # Windows makes a junction here; os.symlink stands in for it.
+        os.symlink(junction_source, junction_target, target_is_directory = True)
+        return True
+
+    set_start_attr(monkeypatch, "_create_directory_junction", create_junction)
     overlay = codex_agent.write_codex_parent_overlay(tmp_path / "managed" / "parent")
+    # History files fall back to a hard link, never a copy.
+    assert os.path.samefile(overlay / "history.jsonl", source / "history.jsonl")
     (overlay / "history.jsonl").write_text("session state\n")
     config.write_text('model = "second"\n')
 
@@ -414,12 +443,17 @@ def test_write_codex_parent_overlay_refreshes_fallback_copies(tmp_path, monkeypa
 
     assert (overlay / "config.toml").read_text() == 'model = "second"\n'
     assert (overlay / "sessions" / "existing.jsonl").read_text() == "existing session\n"
-    assert (overlay / "history.jsonl").read_text() == "session state\n"
+    assert (source / "history.jsonl").read_text() == "session state\n"
+    assert not (overlay / "history.jsonl.agent-switch-old").exists()
 
     config.unlink()
     overlay = codex_agent.write_codex_parent_overlay(overlay)
     assert not (overlay / "config.toml").exists()
-    assert (overlay / "history.jsonl").read_text() == "session state\n"
+    assert (source / "history.jsonl").read_text() == "session state\n"
+    # A dir that can't be linked at all stops the launch: history is never copied.
+    set_start_attr(monkeypatch, "_create_directory_junction", lambda source, target: False)
+    with pytest.raises(typer.Exit):
+        codex_agent.write_codex_parent_overlay(tmp_path / "managed" / "other")
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
@@ -549,10 +583,168 @@ def test_connect_codex_no_launch(fake_vllm, tmp_path):
     assert (home / "agent_switch.config.toml").exists()
 
 
+@pytest.mark.parametrize("shell_sqlite", [None, "/my/codex-sqlite", "  "])
+def test_codex_url_shares_your_session_history(fake_vllm, tmp_path, monkeypatch, shell_sqlite):
+    user = Path.home() / ".codex"
+    user.mkdir(parents = True)
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    if shell_sqlite:
+        monkeypatch.setenv("CODEX_SQLITE_HOME", shell_sqlite)
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    home = tmp_path / "agents" / "codex"
+    # CODEX_HOME stays the session's, so the profile and a /model pick stay out of your config.
+    _assert_env_set(result.output, "CODEX_HOME", str(home))
+    for name in (*codex_agent._CODEX_USER_SESSION_DIRS, *codex_agent._CODEX_USER_SESSION_FILES):
+        assert (home / name).resolve() == user / name, name
+    if shell_sqlite and shell_sqlite.strip():
+        # The shell's own value reaches codex as it is.
+        assert "CODEX_SQLITE_HOME" not in result.output
+    else:
+        # codex takes a blank one as unset (references/codex/codex-rs/core/src/config/mod.rs:276-282).
+        _assert_env_set(result.output, "CODEX_SQLITE_HOME", str(user))
+
+
+def _capture_codex_run(monkeypatch) -> dict:
+    """What the launched codex sees in its CODEX_HOME while it runs."""
+    seen = {}
+    monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
+
+    def run(command, env = None, **kwargs):
+        if env and "CODEX_HOME" in env:
+            home = Path(env["CODEX_HOME"])
+            seen.update(home = home, env = env, is_linked = os.path.lexists(home / "sessions"))
+        return SimpleNamespace(returncode = 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+@pytest.mark.parametrize("is_persisted", [True, False])
+def test_codex_url_launch_keeps_a_fixed_home_unless_no_persist(fake_vllm, tmp_path, monkeypatch, is_persisted):
+    user = Path.home() / ".codex"
+    user.mkdir(parents = True)
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", "" if is_persisted else str(user))
+    seen = _capture_codex_run(monkeypatch)
+    flags = [] if is_persisted else ["--no-persist"]
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, *flags])
+    assert result.exit_code == 0, result.output
+    if is_persisted:
+        # codex records a thread's rollout path through CODEX_HOME
+        # (references/codex/codex-rs/rollout/src/recorder.rs:1770-1791), so the home stays.
+        assert seen["home"] == tmp_path / "agents" / "codex" and seen["home"].is_dir()
+        assert seen["is_linked"] and seen["env"]["CODEX_SQLITE_HOME"] == str(user)
+    else:
+        # A throwaway session shares nothing, not even through an inherited CODEX_SQLITE_HOME.
+        assert seen["home"].parent == tmp_path / "agents" / ".tmp" and not seen["home"].exists()
+        assert not seen["is_linked"] and not seen["env"].get("CODEX_SQLITE_HOME")
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_codex_no_persist_recipe_keeps_a_dir_of_its_own(fake_vllm, tmp_path, monkeypatch):
+    user = Path.home() / ".codex"
+    user.mkdir(parents = True)
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    shared = tmp_path / "agents" / "codex"
+    assert CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"]).exit_code == 0
+    isolated = tmp_path / "agents" / "codex-isolated"
+    # A link a sharing run could have left there, and history of the isolated session's own.
+    isolated.mkdir(parents = True)
+    (isolated / "sessions").symlink_to(user / "sessions", target_is_directory = True)
+    (isolated / "history.jsonl").write_text("isolated\n")
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", "--no-persist"])
+    assert result.exit_code == 0, result.output
+    _assert_env_set(result.output, "CODEX_HOME", str(isolated))
+    _assert_env_unset(result.output, "CODEX_SQLITE_HOME")
+    # The shared dir keeps its links, so the threads recorded through it stay resumable.
+    for name in (*codex_agent._CODEX_USER_SESSION_DIRS, *codex_agent._CODEX_USER_SESSION_FILES):
+        assert (shared / name).resolve() == user / name, name
+    assert not os.path.lexists(isolated / "sessions")
+    assert (isolated / "history.jsonl").read_text() == "isolated\n"
+
+
+def test_codex_kept_dirs_follow_your_codex_home(fake_vllm, tmp_path, monkeypatch):
+    other = tmp_path / "work-codex"
+    other.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(other))
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    # A thread's recorded path runs through the kept dir, so each codex home gets its own.
+    digest = hashlib.sha256(str(other.resolve()).encode()).hexdigest()[:8]
+    home = tmp_path / "agents" / f"codex-{digest}"
+    _assert_env_set(result.output, "CODEX_HOME", str(home))
+    assert (home / "sessions").resolve() == other / "sessions"
+    assert not (tmp_path / "agents" / "codex").exists()
+
+
+def test_codex_as_subagent_launch_keeps_its_parent_dir(fake_vllm, tmp_path, monkeypatch):
+    (Path.home() / ".codex").mkdir(parents = True)
+    seen = _capture_codex_run(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--as-subagent"])
+    assert result.exit_code == 0, result.output
+    assert seen["home"] == tmp_path / "agents" / "codex-subagent" / "parent" and seen["home"].is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "asserts POSIX symlinks")
+def test_codex_url_moves_a_persisted_session_history_aside(fake_vllm, tmp_path, monkeypatch):
+    user = Path.home() / ".codex"
+    user.mkdir(parents = True)
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    home = tmp_path / "agents" / "codex"
+    (home / "sessions" / "2026").mkdir(parents = True)
+    (home / "sessions" / "2026" / "rollout.jsonl").write_text("old\n")
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch", "--persist"])
+    assert result.exit_code == 0, result.output
+    assert (home / "sessions").resolve() == user / "sessions"
+    moved = home / "sessions.agent-switch-old"
+    assert (moved / "2026" / "rollout.jsonl").read_text() == "old\n"
+    assert str(moved) in result.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
+def test_codex_url_keeps_its_own_history_for_a_windows_codex_under_wsl(fake_vllm, tmp_path, monkeypatch):
+    user = tmp_path / "user-codex"
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    # What a Linux codex run left in its own dir, and a link left in the Windows one.
+    linux_store = tmp_path / "linux-codex" / "sessions"
+    linux_store.mkdir(parents = True)
+    for name in ("codex", "codex-windows"):
+        (tmp_path / "agents" / name).mkdir(parents = True)
+        (tmp_path / "agents" / name / "sessions").symlink_to(linux_store, target_is_directory = True)
+    set_start_attr(monkeypatch, "_wsl_windows_executable", lambda command: "/mnt/c/npm/codex.cmd")
+    set_start_attr(monkeypatch, "_wsl_windows_path", str)
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-launch"])
+    assert result.exit_code == 0, result.output
+    # A dir of its own, so Linux and Windows codex never meet each other's links.
+    home = tmp_path / "agents" / "codex-windows"
+    _assert_env_set(result.output, "CODEX_HOME", str(home))
+    assert (tmp_path / "agents" / "codex" / "sessions").resolve() == linux_store
+    # A Windows codex can't follow a link into WSL, so nothing is linked, and it says so.
+    assert not os.path.lexists(home / "sessions") and not user.exists()
+    # Its threads stay out of your SQLite state too: an inherited CODEX_SQLITE_HOME reaches the
+    # Windows process empty, which codex reads as unset (core/src/config/mod.rs:276-282).
+    assert "export CODEX_SQLITE_HOME=\n" in result.output
+    assert "history" in result.output
+
+
+def test_codex_as_subagent_no_persist_parent_shares_nothing(fake_vllm, tmp_path, monkeypatch):
+    user = tmp_path / "user-codex"
+    (user / "sessions").mkdir(parents = True)
+    (user / "auth.json").write_text("{}\n")
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(user))
+    seen = _capture_codex_run(monkeypatch)
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--as-subagent", "--no-persist"])
+    assert result.exit_code == 0, result.output
+    assert seen["home"].name == "parent" and not seen["is_linked"]
+    assert not seen["env"].get("CODEX_SQLITE_HOME")
+
+
 def test_connect_codex_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, monkeypatch):
     set_start_attr(monkeypatch, "_codex_supports_model_catalog", lambda: True)
-    source_home = tmp_path / "user-codex"
-    source_home.mkdir()
+    source_home = Path.home() / ".codex"
+    source_home.mkdir(parents = True)
     (source_home / "config.toml").write_text('model = "cloud-model"\n')
     (source_home / "AGENTS.md").write_text("Keep the user's guidance.\n")
     monkeypatch.setenv("CODEX_HOME", str(source_home))
@@ -574,6 +766,9 @@ def test_connect_codex_as_subagent_preserves_cloud_parent(fake_vllm, tmp_path, m
     assert "--model" not in command
     parent_home = tmp_path / "agents" / "codex-subagent" / "parent"
     _assert_env_set(result.output, "CODEX_HOME", str(parent_home))
+    # The cloud parent keeps your threads, its SQLite state included.
+    _assert_env_set(result.output, "CODEX_SQLITE_HOME", str(source_home))
+    assert (parent_home / "sessions").resolve() == source_home / "sessions"
     for name in codex_agent._CODEX_ENV_UNSET:
         _assert_env_kept(result.output, name)
     assert codex_agent._CODEX_ENV_KEY not in result.output
@@ -619,7 +814,7 @@ def test_connect_codex_matches_requested_model_case_insensitively(fake_vllm, tmp
 
 
 def test_connect_codex_launch_uses_ephemeral_home(fake_vllm, monkeypatch):
-    # Launch mode writes config to a throwaway temp CODEX_HOME and removes it after
+    # --no-persist writes config to a throwaway temp CODEX_HOME and removes it after
     # the agent exits; the user's real ~/.codex is never the target.
     captured = {}
     monkeypatch.setattr(shutil, "which", lambda name, path = None: "/usr/local/bin/codex")
@@ -630,7 +825,7 @@ def test_connect_codex_launch_uses_ephemeral_home(fake_vllm, monkeypatch):
         return SimpleNamespace(returncode = 0)
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE])
+    result = CliRunner().invoke(start.start_app, ["codex", "--url", BASE, "--no-persist"])
     assert result.exit_code == 0, result.output
     home = Path(captured["home"])
     assert captured["config_present"]  # config existed while codex ran
@@ -1039,6 +1234,8 @@ def test_native_codex_http_headers_ride_process_env(fake_vllm, monkeypatch):
         ["--api-key", "sk-x"],
         ["--as-subagent"],
         ["--persist"],
+        # Kept by default for codex, so the other spelling is a local-only flag too.
+        ["--no-persist"],
     ],
 )
 def test_native_codex_refuses_local_only_flags(fake_vllm, monkeypatch, flag):
@@ -1083,8 +1280,44 @@ def test_native_codex_skill_uses_additive_overlay_and_rules(fake_vllm, tmp_path,
     cleared = CliRunner().invoke(start.start_app, ["codex", "--no-launch", "--", "exec", "hello"])
     assert cleared.exit_code == 0, cleared.output
     assert _launch_command(cleared.output) == ["codex", "exec", "hello"]
-    assert not overlay.exists()
+    # Only the history links stay: the threads codex recorded through them stay resumable.
+    shared = (*codex_agent._CODEX_USER_SESSION_DIRS, *codex_agent._CODEX_USER_SESSION_FILES)
+    # The manifest stays too, so the next plain run still knows a hard link to your file.
+    assert sorted(os.listdir(overlay)) == sorted([*shared, codex_agent._CODEX_PARENT_OVERLAY_MANIFEST])
+    assert all((overlay / name).resolve() == home / name for name in shared)
     assert _snapshot_skill_tree(home) == before_home
+
+
+def test_native_codex_plain_run_keeps_history_links_and_real_threads(fake_vllm, tmp_path, monkeypatch):
+    _native_no_connect(monkeypatch)
+    user = Path.home() / ".codex"
+    user.mkdir(parents = True)
+    (user / "history.jsonl").write_text("mine\n")
+    monkeypatch.setenv("CODEX_HOME", str(user))
+    overlay = tmp_path / "agents" / "codex-native" / "home"
+    # A --skill overlay from an earlier run: real sessions codex wrote there before it linked
+    # yours, and history.jsonl hard-linked to yours where symlinks are not allowed.
+    (overlay / "sessions" / "2026").mkdir(parents = True)
+    (overlay / "sessions" / "2026" / "rollout.jsonl").write_text("old\n")
+    os.link(user / "history.jsonl", overlay / "history.jsonl")
+    manifest = overlay / codex_agent._CODEX_PARENT_OVERLAY_MANIFEST
+    manifest.write_text(json.dumps({"source_home": str(user.resolve()), "entries": ["config.toml"]}))
+    (overlay / "config.toml").write_text("copied\n")
+    # What codex wrote into the overlay itself, a login among them; the manifest lists none of it.
+    (overlay / "auth.json").write_text('{"auth": "overlay login"}\n')
+    (overlay / "log").mkdir()
+    result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
+    assert result.exit_code == 0, result.output
+    assert (overlay / "sessions.agent-switch-old" / "2026" / "rollout.jsonl").read_text() == "old\n"
+    # A hard link to your file is kept, not moved aside: threads recorded through it stay
+    # resumable. The overlay's own entries go; its manifest stays.
+    assert sorted(os.listdir(overlay)) == [manifest.name, "history.jsonl", "sessions.agent-switch-old"]
+    assert os.path.samefile(overlay / "history.jsonl", user / "history.jsonl")
+    # A second plain run still knows that hard link, so it is not moved aside as session data.
+    assert CliRunner().invoke(start.start_app, ["codex", "--no-launch"]).exit_code == 0
+    assert os.path.samefile(overlay / "history.jsonl", user / "history.jsonl")
+    assert not (overlay / "history.jsonl.agent-switch-old").exists()
+    assert (user / "history.jsonl").read_text() == "mine\n"
 
 
 def test_native_codex_skill_set_injects_nested_skills(fake_vllm, tmp_path, monkeypatch, codex_skill_sources):
@@ -1230,6 +1463,7 @@ def test_write_codex_parent_overlay_keeps_source_skill_manifest_private(tmp_path
     user_skill.mkdir(parents = True)
     (user_skill / "SKILL.md").write_text("User skill.\n")
     (home / "skills" / ".agent-switch-skills.json").write_text('{"entries": ["user-only"]}\n')
+    _make_codex_user_stores(home)
     source = tmp_path / "injected"
     source.mkdir()
     (source / "SKILL.md").write_text("Injected skill.\n")
@@ -1263,6 +1497,8 @@ def test_codex_skill_launch_matches_no_launch_recipe(fake_vllm, tmp_path, monkey
     launched = CliRunner().invoke(start.start_app, [*args, "--", "exec", "hello"])
     assert launched.exit_code == 0, launched.output
     actual_home = captured["env"]["CODEX_HOME"]
+    # The launch keeps the recipe's fixed home, so the threads it records stay resumable.
+    assert actual_home == str(recipe_home)
     assert captured["command"] == [
         part.replace(str(recipe_home), actual_home) for part in _launch_command(recipe.output)
     ]
@@ -1277,7 +1513,14 @@ def test_write_codex_parent_overlay_copies_user_skill_children_when_links_fail(t
         raise OSError("Symlinks unavailable.")
 
     monkeypatch.setattr(Path, "symlink_to", deny_symlink)
-    set_start_attr(monkeypatch, "_create_directory_junction", lambda *args: False)
+
+    def create_junction(junction_source, junction_target):
+        # Without symlinks, Windows still makes a junction for the history dirs, which are never
+        # copied; os.symlink stands in for it.
+        os.symlink(junction_source, junction_target, target_is_directory = True)
+        return True
+
+    set_start_attr(monkeypatch, "_create_directory_junction", create_junction)
     monkeypatch.setattr(core_skills, "_create_directory_junction", lambda *args: False)
     overlay = codex_agent.write_codex_parent_overlay(
         tmp_path / "overlay", routing = None, skills = {"shared": source}

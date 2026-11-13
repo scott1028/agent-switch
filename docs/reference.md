@@ -368,11 +368,12 @@ Put agent arguments after `--`; they reach the agent unchanged, for example
 
 ### Session history
 
-claude, opencode, omp, pi, dsh and dsh-tui read and write your own session history in each mode:
-native, native with `--skill` or MCP flags, `--url`, and `--url --persist`. A session you start
+Every agent reads and writes your own session history in each mode: native, native with
+`--skill` or MCP flags, `--as-subagent`, `--url`, and `--url --persist`. A session you start
 natively can be resumed through agent-switch, and the other way round. The exceptions: a Windows
-pi or dsh run from WSL keeps its own history, and dsh and dsh-tui don't follow a session store
-your own dsh patch layers move or re-encode (see [DeepSeek Harness](#deepseek-harness)).
+codex, pi or dsh run from WSL keeps its own history; dsh and dsh-tui don't follow a session store
+your own dsh patch layers move or re-encode (see [DeepSeek Harness](#deepseek-harness)); codex
+with `--no-persist` shares nothing; and codex lists sessions by model provider (see below).
 
 | Agent | Your history | How a session reaches it |
 |---|---|---|
@@ -382,11 +383,61 @@ your own dsh patch layers move or re-encode (see [DeepSeek Harness](#deepseek-ha
 | pi | `sessions` in your pi agent dir | a link, see below |
 | dsh | `sessions` and `attachments` in your DSH home | patch rows, see [DeepSeek Harness](#deepseek-harness) |
 | dsh-tui, dst | the same store, or your `DSH_TUI_SESSION_ROOT` | `DSH_TUI_SESSION_ROOT`, see [DeepSeek Harness](#deepseek-harness) |
+| codex | `sessions`, `archived_sessions`, `thread-writer-locks`, `session_index.jsonl`, `history.jsonl` and the SQLite state in your codex home | links and `CODEX_SQLITE_HOME`, see below |
 
 - `--persist` keeps the agent-switch session folder between runs: settings and other state changed
-  inside the session, and dsh-tui's installed profile. The agents above resume without it.
-- codex still runs with its whole home moved into a session folder that is deleted on exit, so it
-  needs `--persist` to resume, for example `agent-switch codex --persist -- resume`.
+  inside the session, and dsh-tui's installed profile. It is on by default for codex and dsh-tui;
+  the other agents resume without it.
+- codex with `--url` or `--provider` keeps `CODEX_HOME` in a session folder that stays between
+  runs, so its `agent_switch` profile, and a `/model` pick made there, never touch your
+  `config.toml`. codex records each new thread's file path through `CODEX_HOME` and keeps that
+  path until the thread is written again, so the folder has to stay: until a thread is resumed,
+  its recorded path runs through that folder's `sessions`, and deleting the folder leaves the
+  thread impossible to resume. Each codex home gets its own folder, so one never re-points
+  another's links: `~/.agent-switch/agents/codex` for `~/.codex`, and
+  `~/.agent-switch/agents/codex-<8 hex digits>` for any other `CODEX_HOME`, from a hash of its
+  path (the `--skill` and `--as-subagent` folders below follow the same rule). Two codex sessions
+  on different servers at the same time share the folder and its `config.toml`. Your history is
+  shared:
+  - `sessions`, `archived_sessions`, `thread-writer-locks`, `session_index.jsonl` and
+    `history.jsonl` in the session link to those in your codex home (`CODEX_HOME`, else
+    `~/.codex`). One missing on your side is created there first. These are always links, never
+    copies (a file falls back to a hard link, a folder to a junction on Windows); when none can
+    be made, the launch stops. Real ones with content from an earlier `--persist` session are
+    moved to `<name>.agent-switch-old`, as for pi.
+  - The SQLite state (`state_5.sqlite` and the other `*.sqlite` files) is never linked:
+    agent-switch sets `CODEX_SQLITE_HOME` to your codex home unless your shell sets it. A
+    `sqlite_home` in your own `config.toml` is not followed with `--url`, since the session reads
+    its own `config.toml`; export `CODEX_SQLITE_HOME` with the same folder instead.
+  - Native `--skill` and `--as-subagent` overlays link the same names, skip the SQLite files and
+    set `CODEX_SQLITE_HOME` the same way; they link your `config.toml`, so a `sqlite_home` there
+    applies. They stay between runs too: `~/.agent-switch/agents/codex-native/home` and
+    `~/.agent-switch/agents/codex-subagent/parent`. A later `--no-launch` without `--skill`
+    removes everything else in the overlay, a login or state codex saved there included, but
+    keeps the history links and the overlay's record of them, and moves real threads found
+    there aside.
+  - `--no-persist` makes a throwaway session that shares nothing: a temporary `CODEX_HOME`
+    deleted on exit, no links into your codex home, no `CODEX_SQLITE_HOME`, and an inherited
+    `CODEX_SQLITE_HOME` is cleared. Its threads can't be resumed after it exits. With
+    `--no-launch` it gets a kept folder of its own, `~/.agent-switch/agents/codex-isolated` (or
+    `<alias>-isolated`, `codex-subagent-isolated`), and never touches the shared folder; links
+    found in its own are removed first. `--as-subagent --no-persist` shares nothing either.
+  - A `codex-<x>` alias works with `--url`: its history is `~/.<alias>` (the `CODEX_HOME` such an
+    alias usually sets), linked the same way, and its folder is `~/.agent-switch/agents/<alias>`.
+    When `~/.<alias>` is not a directory, the session keeps its own history, with a note.
+    agent-switch starts plain `codex`, not the alias, so flags and env the alias adds do not
+    apply. `--skill` and `--as-subagent` are still refused for an alias.
+  - codex lists sessions, and picks `--last`, by model provider: native sessions record `openai`,
+    agent-switch ones `agent_switch`. Only `codex resume <UUID>` crosses that line, for example
+    `agent-switch codex --url ... -- resume <UUID>`, and resuming records the session under the
+    provider that resumed it. To open an agent-switch session natively, add `-m <model>` or
+    `-c model_provider=openai`.
+  - Deleting a thread inside the session rewrites `session_index.jsonl` over the link; the next
+    run moves that copy aside and links yours again, so the deletion does not reach your index.
+  - A Windows codex run from WSL can't follow the links, so its session keeps its own history,
+    with a note, and an inherited `CODEX_SQLITE_HOME` is cleared for it. It gets folders of its
+    own (`codex-windows`, `codex-native-windows`, `codex-subagent-windows`, `<alias>-windows`),
+    so it never meets a Linux codex's links; links found in them are removed first.
 - pi with `--url` or `--provider` moves `HOME` and `PI_CODING_AGENT_DIR` into its session folder,
   but shares your history, so `--resume` and `--continue` see your native pi sessions and native
   pi sees the ones made there:
@@ -431,6 +482,11 @@ your own dsh patch layers move or re-encode (see [DeepSeek Harness](#deepseek-ha
   for dsh-tui. To browse the dsh-tui ones, start it once with `DSH_TUI_SESSION_ROOT` set to that
   folder. Those of a run without `--persist` (dsh) or with `--no-persist` (dsh-tui) were deleted
   on exit.
+- Older codex sessions stay where they were as well: `~/.agent-switch/agents/codex/sessions` and
+  `archived_sessions` for a `--persist` or `--no-launch` session (moved to
+  `<name>.agent-switch-old` on the next run), and the `sessions` of a fixed `--no-launch` overlay
+  in `~/.agent-switch/agents/codex-native/home` or `codex-subagent/parent`. Those of a run without
+  `--persist` were deleted on exit.
 
 ### Plan files
 
@@ -614,9 +670,10 @@ agent-switch codex-personal --mcp-stdio 'blender:"uv run --directory ~/blender-m
 - An alias whose definition mentions `agent-switch` is refused, because it would call itself.
 - Native mode (no `--url`/`--provider`) works for every kind of alias. `omp-*` runs natively only
   without `--skill`, `--skill-set` and MCP flags.
-- Local model mode works only for `claude-*` and `opencode-*`, whose session settings travel as env
-  vars and flags that a forwarding function keeps. With `--url`/`--provider`, these are refused:
-  `codex-*` (the function sets its own CODEX_HOME), `pi-*` (PI_CODING_AGENT_DIR),
+- Local model mode works for `claude-*` and `opencode-*`, whose session settings travel as env
+  vars and flags that a forwarding function keeps, and for `codex-*`, which then starts plain
+  `codex` on the alias's `~/.<alias>` history (see [Session history](#session-history)). With
+  `--url`/`--provider`, these are refused: `pi-*` (PI_CODING_AGENT_DIR),
   `dsh-*`/`dsh-tui-*` (DSH_HOME/HOME) and `omp-*` (an `omp --profile <name> --alias` alias selects
   a profile, and a profile ignores PI_CODING_AGENT_DIR).
 - `--as-subagent` is refused for aliases.
@@ -791,7 +848,7 @@ agent-switch claude --skill https://github.com/user/repo/tree/main/skills/my-ski
 | Agent | How the skill is loaded | Which same-name skill wins |
 |---|---|---|
 | Claude Code | `--add-dir=<session>/agent-switch`; the skill is in `.claude/skills/<name>`. | With no clash, the injected skill has the bare name. On a clash, your skill keeps that name and the injected skill is `agent-switch:<name>` on Claude Code 2.1.309 or newer; older versions hide the injected skill. |
-| Codex | Native mode sets an overlay `CODEX_HOME` linked to your Codex home. Routed mode uses the session `CODEX_HOME`; `-c skills.config` enables the injected path and disables the same-name entry. | The injected skill wins over same-name skills. |
+| Codex | Native mode sets an overlay `CODEX_HOME` linked to your Codex home, your thread history included, and `CODEX_SQLITE_HOME` at your Codex home for its SQLite state (see [Session history](#session-history)). Routed mode uses the session `CODEX_HOME`; `-c skills.config` enables the injected path and disables the same-name entry. | The injected skill wins over same-name skills. |
 | OpenCode | `skills.paths` in the session `OPENCODE_CONFIG`. | The injected skill wins over global skills, `~/.claude/skills`, `~/.agents/skills`, and project `.opencode/skills` on OpenCode 2.0.3. OpenCode 1.x was not verified. |
 | Pi | `<agent dir>/skills`. Native mode sets an overlay `PI_CODING_AGENT_DIR` linked to your Pi home. | The injected skill wins over `~/.pi/agent/skills` and `~/.agents/skills`; project `.pi/skills` and `.agents/skills` win, as do a same-name skill from a `skills` entry in user or project `settings.json` and pi's own `--skill`. A `!name` pattern in `settings.json` or `--no-skills` hides the injected skill. From `~/.pi/agent/skills`, only top-level skill folders of the same name are hidden; same-name `*.md` files at its root and nested `SKILL.md` folders still load. With native `--skill`, user `settings.json` paths that start with `../` do not resolve. If a persisted session already has its own unowned `skills` folder, injection stops with an error instead of replacing it. |
 | OMP | `<agent dir>/skills`. Native mode sets an overlay `PI_CODING_AGENT_DIR` linked to your omp agent dir; `--url` mode uses the session agent dir. | The injected skill wins over the other skills in your agent dir's `skills` and over `~/.agents/skills`, Claude Code, Codex and omp plugin skills. Project `.omp/skills` and `skills.customDirectories` win. `--no-skills` hides it, and omp's `--skills` patterns filter it like any skill. |
