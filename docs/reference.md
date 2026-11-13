@@ -134,6 +134,19 @@ with 0.14.0 on dsh 0.1.5-rc.2 and 0.2.0-rc.2) on the same route. Both names shar
   `/settings`, the TUI's preferences and the installed profile survive between runs.
   `-- --resume <id>` reopens any session in the shared store; `-- -c` continues only the last
   session started from this session folder.
+- After you upgrade dsh-tui, the profile kept in the session folder is older than the launcher.
+  When the upgrade crosses a major or minor version (0.17 to 0.20), the launcher refuses to start
+  ("the profile runs v0.17.0 but this launcher is v0.20.0"); after a patch or pre-release upgrade
+  it starts with a note. So before each start, agent-switch asks the launcher for its version
+  (`dsh-tui version`). When the profile is older, it runs
+  `dsh plugin --profile dsh-tui add @deepseek-harness-tui/dsh-tui@<launcher version>` in the
+  session's environment (its `HOME`, `DSH_HOME` and pnpm store), and prints the folder and both
+  versions. A profile of the same or a newer version, or none yet, is left to the launcher.
+- If that update fails, agent-switch prints the command to run yourself. It stops when the
+  launcher would refuse the profile; otherwise it warns and starts dsh-tui with the older profile.
+- `--no-launch` does not update the profile, because the recipe may run later or elsewhere with
+  another launcher. Start agent-switch once without `--no-launch`, or run that `add` in the
+  recipe's environment.
 - `--no-persist` uses a throwaway folder deleted on exit; your sessions still land in your store.
   The TUI profile is then installed with pnpm again on every start (about 9 s and 89 MB in
   testing).

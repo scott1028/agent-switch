@@ -3,10 +3,12 @@
 
 """`agent-switch dsh` / `dsh-tui` / `dst`: DeepSeek Harness patch, TUI guards and state."""
 
+import itertools
 import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Literal, Optional
@@ -803,6 +805,107 @@ def _warn_dsh_user_session_rows(source_home: Path, profile: Optional[str]) -> No
         )
 
 
+# The launcher's `version` line names its own package.json version, the one it holds the profile
+# to (references/dsh-tui/bin/dsh-tui.js:61-62,623-628,1425-1427).
+_DSH_TUI_VERSION_LINE = re.compile(rf"^{re.escape(_DSH_TUI_PACKAGE)} (\S+) \(", re.MULTILINE)
+
+
+_DSH_TUI_SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", re.ASCII)
+
+
+def _get_is_version_newer(version: str, other: str) -> bool:
+    """The launcher's isVersionNewer (references/dsh-tui/bin/dsh-tui.js:145-176)."""
+    left = _DSH_TUI_SEMVER.fullmatch(version.strip())
+    right = _DSH_TUI_SEMVER.fullmatch(other.strip())
+    if left is None or right is None:
+        return False
+    left_core, right_core = (tuple(map(int, match.groups()[:3])) for match in (left, right))
+    if left_core != right_core:
+        return left_core > right_core
+    if left[4] is None or right[4] is None:
+        # A release is newer than its pre-releases.
+        return left[4] is None and right[4] is not None
+    for mine, theirs in itertools.zip_longest(left[4].split("."), right[4].split(".")):
+        if mine is None or theirs is None:
+            return mine is not None
+        if mine != theirs:
+            if mine.isdigit() and theirs.isdigit():
+                return int(mine) > int(theirs)
+            # A numeric identifier sorts before an alphanumeric one.
+            return theirs.isdigit() if mine.isdigit() != theirs.isdigit() else mine > theirs
+    return False
+
+
+def _align_dsh_tui_profile(launcher: str, harness: str, dsh_home: Path, home: Path) -> None:
+    """Update the session's dsh-tui profile to the launcher's version when it is older.
+
+    The launcher installs only a missing profile and refuses one from an older release line
+    (references/dsh-tui/bin/dsh-tui.js:1537-1542), so a kept session goes stale on its upgrade.
+    """
+    profile = dsh_home / "profiles" / _DSH_TUI_AGENT
+    # Where the launcher reads the profile's version (references/dsh-tui/bin/dsh-tui.js:580-584).
+    metadata = _read_json_object(
+        profile / "node_modules" / "@deepseek-harness-tui" / "dsh-tui" / "package.json"
+    )
+    installed = metadata.get("version") if isinstance(metadata, dict) else None
+    if not isinstance(installed, str):
+        # The launcher installs a missing profile itself, at its own version.
+        return
+    env = {**_get_dsh_tui_env(home), "DSH_HOME": str(dsh_home)}
+    unset_env = _get_dsh_tui_unset_env(env)
+    child_env = {name: value for name, value in os.environ.items() if name not in unset_env}
+    child_env.update(env)
+    try:
+        # `version` answers before any delegation or bootstrap, so it changes nothing.
+        probe = subprocess.run(
+            [launcher, "version"],
+            env = child_env,
+            capture_output = True,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = 5,
+            check = False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    match = _DSH_TUI_VERSION_LINE.search(probe.stdout or "") if probe.returncode == 0 else None
+    if match is None or not _get_is_version_newer(match[1], installed):
+        return
+    version = match[1]
+    typer.echo(
+        f"Updating the dsh-tui profile in {profile} from v{installed} to v{version}, "
+        "the version of your dsh-tui launcher.",
+        err = True,
+    )
+    # The add the launcher itself asks for (references/dsh-tui/bin/dsh-tui.js:1432-1435).
+    command = [
+        harness, "plugin", "--profile", _DSH_TUI_AGENT, "add", f"{_DSH_TUI_PACKAGE}@{version}"
+    ]
+    code = subprocess.run(command, env = child_env, check = False).returncode
+    if not code:
+        return
+    removed = (arg for name in unset_env if name in os.environ for arg in ("-u", name))
+    assignments = (f"{name}={value}" for name, value in env.items())
+    manual = shlex.join(["env", *removed, *assignments, *command])
+    # The launcher refuses only a profile from an older major.minor; within one it starts with a
+    # note (references/dsh-tui/bin/dsh-tui.js:1426-1437).
+    installed_line, launcher_line = (
+        tuple(map(int, _DSH_TUI_SEMVER.fullmatch(value.strip()).groups()[:2]))
+        for value in (installed, version)
+    )
+    if installed_line < launcher_line:
+        _fail(
+            f"Couldn't update the dsh-tui profile in {profile} to v{version} (exit {code}); "
+            f"run `{manual}`, then retry."
+        )
+    typer.echo(
+        f"Warning: couldn't update the dsh-tui profile in {profile} to v{version} (exit {code}), "
+        f"so dsh-tui starts with v{installed}; to update it, run `{manual}`.",
+        err = True,
+    )
+
+
 def _check_dsh_tui_skills(dsh_home: Path, home: Path, *, is_native: bool) -> None:
     """Require the profile's runtime export and explain the supported preset scope."""
     profile = dsh_home / "profiles" / "dsh-tui"
@@ -1094,6 +1197,9 @@ def dsh(
             # Recheck the real home: an unwritable agents dir falls back to the system temp dir.
             _check_dsh_tui_home(agent, home)
         dsh_home = home / ".dsh" if is_tui else home
+        if is_tui and launch:
+            # A recipe may run elsewhere, against another launcher, so only a launch aligns.
+            _align_dsh_tui_profile(launcher, harness, dsh_home, home)
         if is_tui and skills:
             _check_dsh_tui_skills(dsh_home, home, is_native = False)
         probe = launcher if is_tui else "dsh"

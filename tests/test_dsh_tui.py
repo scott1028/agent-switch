@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 import yaml
 from typer.testing import CliRunner
 
@@ -469,6 +471,182 @@ def test_path_is_left_alone_when_the_first_dsh_is_the_harness(
     result, captured = _launch(monkeypatch, ["dsh-tui", "--url", BASE])
     assert result.exit_code == 0, result.output
     assert captured["env"]["PATH"] == os.environ["PATH"]
+
+
+def _write_session_profile(dsh_home: Path, version: str) -> Path:
+    profile = dsh_home / "profiles" / "dsh-tui"
+    package = profile / "node_modules" / "@deepseek-harness-tui" / "dsh-tui"
+    package.mkdir(parents = True)
+    (package / "package.json").write_text(json.dumps({"name": _TUI_MARKER, "version": version}))
+    return profile
+
+
+def _stub_profile_runs(monkeypatch, version_run, add_returncode = 0) -> list:
+    """Answer the launcher's `version` with ``version_run`` (a result or an error); record calls."""
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[1:] == ["version"]:
+            if isinstance(version_run, BaseException):
+                raise version_run
+            return version_run
+        return SimpleNamespace(returncode = add_returncode)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def _version_run(stdout: str, returncode: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(returncode = returncode, stdout = stdout, stderr = "")
+
+
+_PROFILE_ADD = ["/opt/bin/dsh", "plugin", "--profile", "dsh-tui", "add"]
+
+
+@pytest.mark.parametrize(
+    ("installed", "launcher"),
+    [("0.17.0", "0.20.0"), ("0.20.0", "0.20.1"), ("0.20.0-rc.1", "0.20.0"), ("0.20.0-rc.2", "0.20.0-rc.10")],
+)
+def test_older_session_profile_is_aligned_to_the_launcher(
+    installed, launcher, tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    dsh_home = home / ".dsh"
+    profile = _write_session_profile(dsh_home, installed)
+    monkeypatch.setenv("PNPM_CONFIG_STORE_DIR", "/my/store")
+    calls = _stub_profile_runs(monkeypatch, _version_run(f"{_TUI_MARKER} {launcher} (launcher)\n"))
+    dsh_agent._align_dsh_tui_profile("/opt/bin/dsh-tui", "/opt/bin/dsh", dsh_home, home)
+    assert [command for command, _ in calls] == [
+        ["/opt/bin/dsh-tui", "version"],
+        [*_PROFILE_ADD, f"{_TUI_MARKER}@{launcher}"],
+    ]
+    # A hung launcher must not hang the start with it.
+    assert calls[0][1].get("timeout")
+    env = calls[-1][1]["env"]
+    expected = {**dsh_agent._get_dsh_tui_env(home), "DSH_HOME": str(dsh_home)}
+    assert {name: env.get(name) for name in expected} == expected
+    # An upper-case store selector would beat ours and send pnpm to your own store.
+    assert "PNPM_CONFIG_STORE_DIR" not in env
+    [line] = capsys.readouterr().err.splitlines()
+    assert str(profile) in line and f"v{installed} to v{launcher}" in line
+
+
+@pytest.mark.parametrize(
+    ("installed", "version_run"),
+    [
+        ("0.20.0", _version_run(f"{_TUI_MARKER} 0.20.0 (launcher)\n")),
+        ("0.21.0", _version_run(f"{_TUI_MARKER} 0.20.0 (launcher)\n")),
+        (None, _version_run(f"{_TUI_MARKER} 0.20.0 (launcher)\n")),
+        ("0.17.0", _version_run(f"{_TUI_MARKER} unknown (launcher)\n")),
+        ("0.17.0", _version_run("")),
+        ("0.17.0", _version_run("dsh-tui 0.20.0 (launcher)\n")),
+        ("0.17.0", _version_run(f"{_TUI_MARKER} 0.20.0 (launcher)\n", returncode = 1)),
+        ("0.17.0", OSError("gone")),
+        ("0.17.0", subprocess.TimeoutExpired("dsh-tui", 5)),
+    ],
+    ids = ["equal", "newer", "missing", "unknown", "silent", "foreign", "failed", "unrunnable", "hung"],
+)
+def test_session_profile_is_left_alone_unless_older(
+    installed, version_run, tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    dsh_home = home / ".dsh"
+    if installed:
+        _write_session_profile(dsh_home, installed)
+    calls = _stub_profile_runs(monkeypatch, version_run)
+    dsh_agent._align_dsh_tui_profile("/opt/bin/dsh-tui", "/opt/bin/dsh", dsh_home, home)
+    assert [command for command, _ in calls if command[:5] == _PROFILE_ADD] == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("installed", "launcher", "is_refused"),
+    [
+        ("0.17.0", "0.20.0", True),
+        ("0.20.9", "1.0.0", True),
+        # Within one major.minor the launcher still starts the older profile, with a note.
+        ("0.20.0", "0.20.1", False),
+        ("0.20.0-rc.1", "0.20.0", False),
+    ],
+)
+def test_failed_alignment_stops_only_where_the_launcher_would_refuse(
+    installed, launcher, is_refused, tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    dsh_home = home / ".dsh"
+    _write_session_profile(dsh_home, installed)
+    env = {**dsh_agent._get_dsh_tui_env(home), "DSH_HOME": str(dsh_home)}
+    for name in dsh_agent._get_dsh_tui_unset_env(env):
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setenv("PNPM_CONFIG_STORE_DIR", "/my/store")
+    _stub_profile_runs(
+        monkeypatch, _version_run(f"{_TUI_MARKER} {launcher} (launcher)\n"), add_returncode = 7
+    )
+    if is_refused:
+        with pytest.raises(typer.Exit) as raised:
+            dsh_agent._align_dsh_tui_profile("/opt/bin/dsh-tui", "/opt/bin/dsh", dsh_home, home)
+        assert raised.value.exit_code == 1
+    else:
+        dsh_agent._align_dsh_tui_profile("/opt/bin/dsh-tui", "/opt/bin/dsh", dsh_home, home)
+    assignments = [f"{name}={value}" for name, value in env.items()]
+    add = [*_PROFILE_ADD, f"{_TUI_MARKER}@{launcher}"]
+    manual = shlex.join(["env", "-u", "PNPM_CONFIG_STORE_DIR", *assignments, *add])
+    last = capsys.readouterr().err.splitlines()[-1]
+    assert f"`{manual}`" in last
+    assert last.startswith("Warning: ") is not is_refused
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX stub launchers")
+@pytest.mark.parametrize(
+    ("launch", "skill"), [(True, False), (True, True), (False, False)], ids = ["launch", "skill", "recipe"]
+)
+def test_only_a_url_launch_aligns_the_session_profile(
+    launch, skill, fake_vllm, short_root, monkeypatch, tmp_path
+):
+    real = tmp_path / "real"
+    tui = _stub(real, "dsh-tui", _TUI_MARKER)
+    harness = _stub(real, "dsh", _HARNESS_MARKER)
+    _launchable(monkeypatch, tmp_path, real)
+    profile = _write_session_profile(short_root / "agents" / "dsh-tui" / ".dsh", "0.17.0")
+    package = profile / "node_modules" / "@deepseek-harness-tui" / "dsh-tui"
+    source = tmp_path / "injected"
+    source.mkdir()
+    (source / "SKILL.md").write_text("---\nname: shared\n---\nINJECTED\n")
+    calls = []
+
+    def run(command, env = None, **kwargs):
+        if env is None:
+            # Identity probes of the stub launchers run for real.
+            return _REAL_RUN(command, **kwargs)
+        calls.append(command)
+        if command[1:] == ["version"]:
+            return _version_run(f"{_TUI_MARKER} 0.20.0 (launcher)\n")
+        if command[1:5] == ["plugin", "--profile", "dsh-tui", "add"]:
+            # As the real add does, the profile now exports what --skill needs.
+            (package / "lib").mkdir()
+            (package / "lib" / "preset-patch.js").write_text("")
+            (package / "package.json").write_text(json.dumps({
+                "name": _TUI_MARKER, "version": "0.20.0",
+                "exports": {"./preset-patch": "./lib/preset-patch.js"},
+            }))
+        return SimpleNamespace(returncode = 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    argv = ["dsh-tui", "--url", BASE] + ([] if launch else ["--no-launch"])
+    argv += ["--skill", str(source)] if skill else []
+    result = CliRunner().invoke(start.start_app, argv)
+    assert result.exit_code == 0, result.output
+    if launch:
+        assert calls[:2] == [
+            [str(tui), "version"],
+            [str(harness), "plugin", "--profile", "dsh-tui", "add", f"{_TUI_MARKER}@0.20.0"],
+        ]
+        # The profile is aligned before the TUI starts, and before --skill checks it.
+        assert calls[2][0] == str(tui) and len(calls) == 3
+    else:
+        # A recipe may run elsewhere, against another launcher, so it runs nothing here.
+        assert calls == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
