@@ -8,9 +8,11 @@ from typing import Optional
 
 import click
 import typer
+import typer._completion_shared as _typer_completion  # no public hook for Typer's bash setup
 from typer.core import TyperGroup
 
 from agent_switch.agents import claude, codex, dsh, omp, opencode, pi
+from agent_switch.core import completion
 from agent_switch.core.launch import _ALIAS_KIND_META, _ALIAS_META
 from agent_switch.core.options import _PASSTHROUGH, _PassthroughCommand
 from agent_switch.core.storage import _agent_switch_home
@@ -36,6 +38,25 @@ class _AliasGroup(TyperGroup):
         return super().get_command(ctx, match.group(1))
 
 
+# Typer's script asks agent-switch for subcommands; `<agent>-<x>` functions and aliases live only
+# in the user's shell, so the wrapper adds matching names from compgen there.
+_typer_completion._completion_scripts["bash"] = _typer_completion.COMPLETION_SCRIPT_BASH + """
+%(complete_func)s_with_aliases() {
+    %(complete_func)s "$@"
+    if [[ $COMP_CWORD -eq 1 ]]; then
+        local IFS=$'\\n' name alias_re='^""" + _ALIAS_KIND.pattern + """$'
+        for name in $(compgen -A function -A alias -A command -- "${COMP_WORDS[1]}"); do
+            [[ $name =~ $alias_re ]] && COMPREPLY+=("$name")
+        done
+    fi
+    return 0
+}
+
+complete -o default -F %(complete_func)s_with_aliases %(prog_name)s
+"""
+_typer_completion.install_bash = completion._install_bash
+
+
 start_app = typer.Typer(
     help = "With --url/--provider the agent runs against that local OpenAI-compatible model "
     "server (--provider lists the supported types) with a throwaway, session-only "
@@ -50,6 +71,22 @@ start_app = typer.Typer(
     context_settings = {"help_option_names": ["-h", "--help"]},
     cls = _AliasGroup,
 )
+
+
+# No docstring, so the Typer(help = ...) text above stays the root help.
+@start_app.callback()
+def _root(
+    uninstall_completion: bool = typer.Option(
+        False,
+        "--uninstall-completion",
+        is_eager = True,
+        expose_value = False,
+        callback = completion._uninstall_completion,
+        help = "Remove the bash completion that --install-completion added.",
+    ),
+) -> None:
+    pass
+
 
 # Each \n\n-separated section is "title\nbody"; _PassthroughCommand.format_help draws it as an
 # option-style panel. Body lines keep their newlines and indentation and stay within 76 columns,

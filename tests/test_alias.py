@@ -304,6 +304,46 @@ def test_check_alias_accepts_a_plain_script(monkeypatch, tmp_path):
     _check_alias("opencode-x")
 
 
+# ── Bash completion ──────────────────────────────────────────────────
+
+# $1 is the --show-completion script; the rest are COMP_WORDS, the last one the word being completed.
+_COMPLETE_IN_BASH = """
+source "$1"; shift
+claude-foo() { :; }
+claudex() { :; }
+alias codex-bar=true
+COMP_WORDS=("$@"); COMP_CWORD=$(($# - 1))
+_agent_switch_completion_with_aliases agent-switch "${COMP_WORDS[COMP_CWORD]}" agent-switch
+printf '%s\\n' "${COMPREPLY[@]}"
+"""
+
+
+def _bash_completion(tmp_path, *words) -> list:
+    env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}"}
+    command = ["bash", "--norc", "--noprofile", "-c", _COMPLETE_IN_BASH, "bash", str(tmp_path / "completion.sh"), *words]
+    return subprocess.run(command, env = env, capture_output = True, text = True, check = True).stdout.split("\n")
+
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason = "needs a real bash")
+def test_bash_completion_adds_alias_names_from_the_shell(tmp_path, monkeypatch):
+    # Typer reads this while building the command, before invoke(env = ...) applies, so set it here.
+    monkeypatch.setenv("_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION", "1")
+    result = CliRunner().invoke(start.start_app, ["--show-completion", "bash"], prog_name = "agent-switch")
+    assert result.exit_code == 0, result.output
+    (tmp_path / "completion.sh").write_text(result.output, encoding = "utf-8")
+    # The stub stands in for Typer's part, which runs agent-switch itself; pi-baz is a PATH command.
+    for name, body in (("agent-switch", "echo claude"), ("pi-baz", "true")):
+        (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n", encoding = "utf-8")
+        (tmp_path / name).chmod(0o755)
+
+    names = _bash_completion(tmp_path, "agent-switch", "")
+    assert {"claude", "claude-foo", "codex-bar", "pi-baz"} <= set(names)
+    assert "claudex" not in names
+    names = _bash_completion(tmp_path, "agent-switch", "claude", "")
+    assert "claude" in names
+    assert not {"claude-foo", "codex-bar", "pi-baz"} & set(names)
+
+
 # ── _agent_command ───────────────────────────────────────────────────
 
 

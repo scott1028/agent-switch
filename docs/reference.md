@@ -690,6 +690,12 @@ agent-switch codex-personal --mcp-stdio 'blender:"uv run --directory ~/blender-m
   `dsh-*`/`dsh-tui-*` (DSH_HOME/HOME) and `omp-*` (an `omp --profile <name> --alias` alias selects
   a profile, and a profile ignores PI_CODING_AGENT_DIR).
 - `--as-subagent` is refused for aliases.
+- `agent-switch --install-completion` (bash only) adds one line to `~/.bashrc` that regenerates the
+  completion with this agent-switch's path in every new interactive shell, so upgrades need no
+  reinstall. It also clears older setups: `~/.bash_completions/agent-switch.sh` with its source line,
+  and a hand-made `~/.bashrc.d/agent-switch-completion`. `agent-switch --uninstall-completion`
+  removes all of them. `agent-switch <agent>-<TAB>` then lists the matching functions, aliases and
+  commands of your current shell, so names you add later need no reinstall.
 
 ## MCP servers
 
