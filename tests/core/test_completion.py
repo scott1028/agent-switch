@@ -83,7 +83,8 @@ def test_launcher_ignores_a_leaked_appimage(tmp_path, monkeypatch):
     monkeypatch.setenv("APPIMAGE", "/opt/easy-herdr")
     monkeypatch.setenv("APPDIR", str(tmp_path / "mount"))
     assert completion._get_launcher() != ["/opt/easy-herdr"]
-    monkeypatch.setattr(sys, "executable", str(tmp_path / "mount" / "usr" / "bin" / "python3"))
+    package = tmp_path / "mount" / "opt" / "python3.12" / "lib" / "python3.12" / "site-packages"
+    monkeypatch.setattr(completion, "__file__", str(package / "agent_switch" / "core" / "x.py"))
     assert completion._get_launcher() == ["/opt/easy-herdr"]
 
 

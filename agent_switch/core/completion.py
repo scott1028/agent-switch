@@ -20,8 +20,9 @@ _COMPLETION_MARKER = "# agent-switch completion"
 def _get_launcher() -> list[str]:
     """The command that runs this agent-switch, for the ~/.bashrc line."""
     appimage, appdir = os.environ.get("APPIMAGE"), os.environ.get("APPDIR")
-    # A parent AppImage (easy-herdr) leaks both vars, so trust them only when we run inside APPDIR.
-    if appimage and appdir and Path(sys.executable).is_relative_to(appdir):
+    # A parent AppImage (easy-herdr) leaks both vars, so trust them only when this code is in
+    # APPDIR. Not sys.executable: python-appimage sets it to the AppImage file, outside APPDIR.
+    if appimage and appdir and Path(__file__).is_relative_to(appdir):
         return [appimage]
     script = Path(sys.argv[0])
     if script.suffix != ".py" and script.is_file() and os.access(script, os.X_OK):
